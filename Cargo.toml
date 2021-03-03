@@ -3,3 +3,6 @@ name = "vdf"
 version = "0.1.0"
 authors = ["porcuquine <porcuquine@gmail.com>"]
 edition = "2018"
+
+[dependencies]
+halo2 = { git="https://github.com/zcash/halo2", branch="main" }
