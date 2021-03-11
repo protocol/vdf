@@ -29,7 +29,11 @@ impl VDF<vesta::Scalar> for VestaVDF {
 // Question: Is this right, or is it the reverse? Which scalar fields' modulus do we want to target?
 pub type TargetVDF = PallasVDF;
 
-type Val<T> = (T, T);
+#[derive(std::cmp::PartialEq, Debug, Clone, Copy)]
+pub struct RoundValue<T> {
+    value: T,
+    round: T,
+}
 
 pub trait VDF<F>: Debug
 where
@@ -60,33 +64,39 @@ where
     }
 
     /// One round in the slow/forward direction.
-    fn round(x: Val<F>) -> Val<F> {
-        (Self::forward_step(F::add(x.0, x.1)), F::add(x.1, F::one()))
+    fn round(x: RoundValue<F>) -> RoundValue<F> {
+        RoundValue {
+            // Increment the value by the round number so problematic values
+            // like 0 and 1 don't consistently defeat the asymmetry.
+            value: Self::forward_step(F::add(x.value, x.round)),
+            // Increment the round.
+            round: F::add(x.round, F::one()),
+        }
     }
 
     /// One round in the fast/inverse direction.
-    fn inverse_round(x: Val<F>) -> Val<F> {
-        (
-            F::add(F::sub(Self::inverse_step(x.0), x.1), F::one()),
-            F::sub(x.1, F::one()),
-        )
+    fn inverse_round(x: RoundValue<F>) -> RoundValue<F> {
+        RoundValue {
+            value: F::add(F::sub(Self::inverse_step(x.value), x.round), F::one()),
+            round: F::sub(x.round, F::one()),
+        }
     }
 
     /// Evaluate input `x` with time/difficulty parameter, `t` in the
     /// slow/forward direction.
-    fn eval(x: Val<F>, t: u64) -> Val<F> {
+    fn eval(x: RoundValue<F>, t: u64) -> RoundValue<F> {
         (0..t).fold(x, |acc, _| Self::round(acc))
     }
 
     /// Invert evaluation of output `x` with time/difficulty parameter, `t` in
     /// the fast/inverse direction.
-    fn inverse_eval(x: Val<F>, t: u64) -> Val<F> {
+    fn inverse_eval(x: RoundValue<F>, t: u64) -> RoundValue<F> {
         (0..t).fold(x, |acc, _| Self::inverse_round(acc))
     }
 
     /// Quickly check that `result` is the result of having slowly evaluated
     /// `original` with time/difficulty parameter `t`.
-    fn check(result: Val<F>, t: u64, original: Val<F>) -> bool {
+    fn check(result: RoundValue<F>, t: u64, original: RoundValue<F>) -> bool {
         original == Self::inverse_eval(result, t)
     }
 
@@ -95,13 +105,13 @@ where
 
 #[derive(Debug)]
 pub struct VanillaVDFProof<V: VDF<F> + Debug, F: FieldExt> {
-    result: Val<F>,
+    result: RoundValue<F>,
     t: u64,
     _v: PhantomData<V>,
 }
 
 impl<V: VDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
-    pub fn eval_and_prove(x: Val<F>, t: u64) -> Self {
+    pub fn eval_and_prove(x: RoundValue<F>, t: u64) -> Self {
         let result = V::eval(x, t);
         Self {
             result,
@@ -110,11 +120,11 @@ impl<V: VDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
         }
     }
 
-    pub fn result(&self) -> Val<F> {
+    pub fn result(&self) -> RoundValue<F> {
         self.result
     }
 
-    pub fn verify(&self, original: Val<F>) -> bool {
+    pub fn verify(&self, original: RoundValue<F>) -> bool {
         V::check(self.result, self.t, original)
     }
 
@@ -177,9 +187,9 @@ mod tests {
 
         for _ in 0..10 {
             let t = 10;
-            let a = F::random(&mut rng);
-            let b = F::random(&mut rng);
-            let x = (a, b);
+            let value = F::random(&mut rng);
+            let round = F::random(&mut rng);
+            let x = RoundValue { value, round };
             let y = V::eval(x, t);
             let z = V::inverse_eval(y, t);
 
@@ -197,9 +207,9 @@ mod tests {
     fn test_vanilla_proof_aux<V: VDF<F>, F: FieldExt>() {
         let mut rng = XorShiftRng::from_seed(TEST_SEED);
 
-        let a = F::random(&mut rng);
-        let b = F::random(&mut rng);
-        let x = (a, b);
+        let value = F::random(&mut rng);
+        let round = F::zero();
+        let x = RoundValue { value, round };
         let t = 12;
         let n = 11;
 
@@ -210,6 +220,7 @@ mod tests {
             acc.append(new_proof).expect("failed to append proof")
         });
 
+        assert_eq!(V::element(final_proof.t), final_proof.result.round);
         assert_eq!(n * t, final_proof.t);
         assert!(final_proof.verify(x));
     }
