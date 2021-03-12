@@ -31,8 +31,8 @@ pub type TargetVDF = PallasVDF;
 
 #[derive(std::cmp::PartialEq, Debug, Clone, Copy)]
 pub struct RoundValue<T> {
-    value: T,
-    round: T,
+    pub value: T,
+    pub round: T,
 }
 
 pub trait VDF<F>: Debug
