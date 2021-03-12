@@ -10,4 +10,9 @@ halo2 = { git="https://github.com/zcash/halo2", branch="remove-metrics" }
 rand = "0.8"
 
 [dev-dependencies]
+criterion = "0.3"
 rand_xorshift = "0.3.0"
+
+[[bench]]
+name = "vdf"
+harness = false
