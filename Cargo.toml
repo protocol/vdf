@@ -6,7 +6,7 @@ edition = "2018"
 
 [dependencies]
 ff = "0.8"
-halo2 = { git="https://github.com/zcash/halo2", branch="remove-metrics" }
+halo2 = { git="https://github.com/zcash/halo2", branch="main" }
 rand = "0.8"
 
 [dev-dependencies]

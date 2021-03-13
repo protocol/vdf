@@ -1,9 +1,9 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use halo2::arithmetic::FieldExt;
 use halo2::pasta::{pallas, vesta};
-use vdf::{PallasVDF, RoundValue, VanillaVDFProof, VestaVDF, VDF};
+use vdf::{PallasVDF, RaguVDF, RoundValue, VanillaVDFProof, VestaVDF};
 
-fn bench_vdf<V: VDF<F>, F: FieldExt>(c: &mut Criterion, name: &str) {
+fn bench_vdf<V: RaguVDF<F>, F: FieldExt>(c: &mut Criterion, name: &str) {
     let t = 10000;
     let mut group = c.benchmark_group(format!("{}VDF-{}", name, t));
 
