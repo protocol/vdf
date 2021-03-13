@@ -5,9 +5,6 @@ parameters:
     type: string
     default: "nightly-2021-03-18"
 
-orbs:
-  codecov: codecov/codecov@1
-
 executors:
   default:
     docker:
@@ -113,7 +110,7 @@ jobs:
       - set-env-path
       - run:
           name: Run cargo clippy
-          command: cargo clippy --all-targets --all-features --workspace -- -D warnings
+          command: cargo +$(cat rust-toolchain) clippy --all-targets --all-features --workspace
 
   test:
     executor: default
@@ -161,9 +158,6 @@ jobs:
             # Only export the coverage of this project, we don't care about coverage of
             # dependencies
             llvm-cov export --ignore-filename-regex=".cargo|.rustup" --format=lcov -instr-profile=default.profdata --object=${OBJECT_FILES} > lcov.info
-      # Codecov automatically merges the reports in case there are several ones uploaded
-      - codecov/upload:
-          file: lcov.info
 
 workflows:
   version: 2.1

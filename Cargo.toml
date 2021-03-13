@@ -5,6 +5,7 @@ authors = ["porcuquine <porcuquine@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+crossbeam = "0.8"
 ff = "0.8"
 halo2 = { git="https://github.com/zcash/halo2", branch = "main" }
 rand = "0.8"
