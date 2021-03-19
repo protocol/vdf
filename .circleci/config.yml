@@ -1,0 +1,185 @@
+version: 2.1
+
+parameters:
+  nightly-version:
+    type: string
+    default: "nightly-2021-03-18"
+
+orbs:
+  codecov: codecov/codecov@1
+
+executors:
+  default:
+    docker:
+      - image: filecoin/rust:latest
+    working_directory: /mnt/crate
+    resource_class: 2xlarge+
+  # In case someone should be run on a GPU instance, comment this section in,
+  # change the `executor` of your job to `gpu` and make sure you also run the
+  # `install-gpu-deps` command
+  #gpu:
+  #  machine:
+  #    image: ubuntu-1604-cuda-10.1:201909-23
+  #  working_directory: ~/gpuci
+  #  resource_class: gpu.nvidia.medium
+
+commands:
+  set-env-path:
+    steps:
+      - run:
+          name: Set the PATH env variable
+          command: |
+            # Also put the Rust LLVM tools into the PATH.
+            echo 'export PATH="$HOME:~/.cargo/bin:~/.rustup/toolchains/<< pipeline.parameters.nightly-version >>-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin:$PATH"' | tee --append $BASH_ENV
+            source $BASH_ENV
+
+  # This command is only needed if the GPU executor is used
+  install-gpu-deps:
+    steps:
+      - run:
+          name: Install libraries for GPU tests
+          command: |
+            sudo apt-get update -y
+            sudo apt install -y ocl-icd-opencl-dev
+
+  restore-workspace:
+    steps:
+      - attach_workspace:
+          at: "."
+
+  save-rustup-cache:
+    steps:
+      # Move things from the home directory to `/tmp` first, so that it can be
+      # restored on executors that have a different home directory.
+      - run: cp -R ~/.cargo ~/.rustup /tmp/
+      - save_cache:
+          name: "Save rustup cache"
+          key: cargo-v1-{{ checksum "rust-toolchain" }}-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}
+          paths:
+            - /tmp/.cargo
+            - /tmp/.rustup
+
+  restore-rustup-cache:
+    steps:
+      - restore_cache:
+          name: "Restore rustup cache"
+          key: cargo-v1-{{ checksum "rust-toolchain" }}-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}
+      # Cache might not be created yet, hence ignore if the move fails
+      - run: cp -R /tmp/.cargo /tmp/.rustup ~/ || true
+
+jobs:
+  cargo_fetch:
+    executor: default
+    steps:
+      - checkout
+      - run:
+          name: Update submodules
+          command: git submodule update --init --recursive
+      - run:
+          name: Calculate dependencies
+          command: cargo generate-lockfile
+      - restore-rustup-cache
+      - run: cargo update
+      - run: cargo fetch
+      - run: rustup install $(cat rust-toolchain)
+      - run: rustup default $(cat rust-toolchain)
+      # A nightly build is needed for code coverage reporting
+      - run: rustup toolchain install << pipeline.parameters.nightly-version >>
+      - run: rustup component add --toolchain << pipeline.parameters.nightly-version >> llvm-tools-preview
+      - run: rustc --version
+      - persist_to_workspace:
+          root: "."
+          paths:
+            - Cargo.lock
+      - save-rustup-cache
+
+  rustfmt:
+    executor: default
+    steps:
+      - checkout
+      - restore-workspace
+      - restore-rustup-cache
+      - set-env-path
+      - run:
+          name: Run cargo fmt
+          command: cargo fmt --all -- --check
+
+  clippy:
+    executor: default
+    steps:
+      - checkout
+      - restore-workspace
+      - restore-rustup-cache
+      - set-env-path
+      - run:
+          name: Run cargo clippy
+          command: cargo clippy --all-targets --all-features --workspace -- -D warnings
+
+  test:
+    executor: default
+    steps:
+      - checkout
+      - set-env-path
+      - restore-workspace
+      - restore-rustup-cache
+      - run:
+          command: cargo test
+
+  coverage_run:
+    executor: default
+    environment:
+      # Incremental build is not supported when profiling
+      CARGO_INCREMENTAL: 0
+      # -Zinstrument-coverage: enable llvm coverage instrumentation
+      # -Ccodegen-units=1: building in parallel is not supported when profiling
+      # -Copt-level=0: disable optimizations for more accurate coverage
+      # -Clink-dead-code: dead code should be considered as not covered code
+      # -Coverflow-checks=off: checking for overflow is not needed for coverage reporting
+      # -Cinline-threshold=0: do not inline
+      RUSTFLAGS: -Zinstrument-coverage -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Cinline-threshold=0
+      # Make sure that each run of an executable creates a new profile file, with the default
+      # name they would override each other
+      LLVM_PROFILE_FILE: "%m.profraw"
+    steps:
+      - checkout
+      - restore-workspace
+      - restore-rustup-cache
+      - set-env-path
+      - run:
+          name: Generate coverage report
+          command: |
+            RUST_LOG=info cargo +<< pipeline.parameters.nightly-version >> test -- --nocapture
+
+            # Do *not* use sparse output. It leads to more lines that are not
+            # taken into account at all
+            llvm-profdata merge --output=default.profdata ./*.profraw
+
+            # The compiled files contain the coverage information. From running the tests we don't
+            # know what those files are called, hence use all files from the `./target/debug/deps`
+            # directory which don't have an extension.
+            OBJECT_FILES=$(find ./target/debug/deps/* -name '*' -not -name '*\.*' -printf '%p,'|head --bytes -1)
+            # Only export the coverage of this project, we don't care about coverage of
+            # dependencies
+            llvm-cov export --ignore-filename-regex=".cargo|.rustup" --format=lcov -instr-profile=default.profdata --object=${OBJECT_FILES} > lcov.info
+      # Codecov automatically merges the reports in case there are several ones uploaded
+      - codecov/upload:
+          file: lcov.info
+
+workflows:
+  version: 2.1
+
+  test:
+    jobs:
+      - cargo_fetch
+      - rustfmt:
+          requires:
+            - cargo_fetch
+      - clippy:
+          requires:
+            - cargo_fetch
+      - test:
+          requires:
+            - cargo_fetch
+      - coverage_run:
+          requires:
+            - cargo_fetch
