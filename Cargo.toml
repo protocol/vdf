@@ -6,8 +6,8 @@ edition = "2018"
 
 [dependencies]
 crossbeam = "0.8"
-ff = "0.8"
-halo2 = { git="https://github.com/zcash/halo2", branch = "main" }
+ff = "0.10"
+pasta_curves = "0.1.2"
 rand = "0.8"
 
 [dev-dependencies]

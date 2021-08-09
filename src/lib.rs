@@ -1,6 +1,6 @@
 use core::fmt::Debug;
-use halo2::arithmetic::FieldExt;
-use halo2::pasta::{pallas, vesta};
+use pasta_curves::arithmetic::FieldExt;
+use pasta_curves::{pallas, vesta};
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem::transmute;
@@ -113,7 +113,7 @@ impl PallasVDF {
                         squares[$index] = $val;
                         ready.store($index, Ordering::SeqCst)
                     };
-                };
+                }
 
                 for _ in 0..t {
                     while ready.load(Ordering::SeqCst) != 0 {}
@@ -161,7 +161,7 @@ impl PallasVDF {
                         squares[$index] = $val;
                         ready.store($index, Ordering::SeqCst)
                     };
-                };
+                }
 
                 for _ in 0..t {
                     while ready.load(Ordering::SeqCst) != 0 {}
