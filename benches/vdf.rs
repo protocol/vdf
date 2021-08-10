@@ -1,15 +1,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use halo2::arithmetic::FieldExt;
-use halo2::pasta::{pallas, vesta};
-use vdf::{EvalMode, PallasVDF, RaguVDF, RoundValue, VanillaVDFProof, VestaVDF};
+use pasta_curves::arithmetic::FieldExt;
+use pasta_curves::{pallas, vesta};
+use vdf::{EvalMode, MinRootVDF, PallasVDF, State, VanillaVDFProof, VestaVDF};
 
-fn bench_eval<V: RaguVDF<F>, F: FieldExt>(eval_mode: EvalMode, c: &mut Criterion, name: &str) {
+fn bench_eval<V: MinRootVDF<F>, F: FieldExt>(eval_mode: EvalMode, c: &mut Criterion, name: &str) {
     let t = 10000;
     let mut group = c.benchmark_group(format!("{}VDF-eval-{:?}-{}", name, eval_mode, t));
 
-    let x = RoundValue {
-        value: V::element(123),
-        round: F::zero(),
+    let x = State {
+        x: V::element(123),
+        y: V::element(321),
+        i: F::zero(),
     };
 
     group.bench_function("eval_and_prove", |b| {
@@ -21,13 +22,14 @@ fn bench_eval<V: RaguVDF<F>, F: FieldExt>(eval_mode: EvalMode, c: &mut Criterion
     group.finish();
 }
 
-fn bench_verify<V: RaguVDF<F>, F: FieldExt>(c: &mut Criterion, name: &str) {
+fn bench_verify<V: MinRootVDF<F>, F: FieldExt>(c: &mut Criterion, name: &str) {
     let t = 10000;
     let mut group = c.benchmark_group(format!("{}VDF-verify-{}", name, t));
 
-    let x = RoundValue {
-        value: V::element(123),
-        round: F::zero(),
+    let x = State {
+        x: V::element(123),
+        y: V::element(321),
+        i: F::zero(),
     };
 
     group.bench_function("verify", |b| {

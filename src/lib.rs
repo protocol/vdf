@@ -120,6 +120,7 @@ impl PallasVDF {
 
                     let mut next_square = squares[0];
 
+                    #[allow(clippy::needless_range_loop)]
                     for i in 0..Self::bit_count() {
                         if i > 0 {
                             next_square = next_square.square();
@@ -170,6 +171,7 @@ impl PallasVDF {
 
                     let first_section_bit_count = 128;
 
+                    #[allow(clippy::needless_range_loop)]
                     for i in 0..first_section_bit_count {
                         if i > 0 {
                             next_square = next_square.square();
@@ -362,8 +364,7 @@ impl PallasVDF {
         let qr32q = sqr_mul(qr32p, 4, q1001);
         let qr32r = sqr_mul(qr32q, 6, q101);
         let qr32s = sqr_mul(qr32r, 37, qr8);
-        let qr32t = sqr_mul(qr32s, 2, q1);
-        qr32t
+        sqr_mul(qr32s, 2, q1)
     }
 
     // Sequential RTL square-and-multiply.
@@ -419,7 +420,7 @@ impl PallasVDF {
         let square_acc = square_acc.mul(&square_acc.square());
         let square_acc = square_acc.mul(&square_acc.square().square().square().square());
 
-        let acc = (0..122)
+        (0..122)
             .scan(square_acc, |state, _| {
                 *state = (*state).square();
 
@@ -432,8 +433,7 @@ impl PallasVDF {
                     (acc, count + 1)
                 }
             })
-            .0;
-        acc
+            .0
     }
 }
 
@@ -489,8 +489,7 @@ impl MinRootVDF<vesta::Scalar> for VestaVDF {
         let pr32p = sqr_mul(pr32o, 6, p1111);
         let pr32q = sqr_mul(pr32p, 2, p11);
         let pr32r = sqr_mul(pr32q, 34, pr8);
-        let pr32s = sqr_mul(pr32r, 2, p1);
-        pr32s
+        sqr_mul(pr32r, 2, p1)
     }
 }
 
