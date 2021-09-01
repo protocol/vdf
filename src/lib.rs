@@ -1,6 +1,6 @@
 use core::fmt::Debug;
-use halo2::arithmetic::FieldExt;
-use halo2::pasta::{pallas, vesta};
+use pasta_curves::arithmetic::FieldExt;
+use pasta_curves::{pallas, vesta};
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem::transmute;
@@ -46,14 +46,14 @@ pub struct PallasVDF {
     eval_mode: EvalMode,
 }
 
-impl RaguVDF<pallas::Scalar> for PallasVDF {
+impl MinRootVDF<pallas::Scalar> for PallasVDF {
     fn new_with_mode(eval_mode: EvalMode) -> Self {
         PallasVDF { eval_mode }
     }
 
     // To bench with this on 3970x:
     // RUSTFLAG="-C target-cpu=native -g" taskset -c 0,40 cargo bench
-    fn eval(&mut self, x: RoundValue<pallas::Scalar>, t: u64) -> RoundValue<pallas::Scalar> {
+    fn eval(&mut self, x: State<pallas::Scalar>, t: u64) -> State<pallas::Scalar> {
         match self.eval_mode {
             EvalMode::LTRSequential
             | EvalMode::LTRAddChainSequential
@@ -92,7 +92,7 @@ impl PallasVDF {
 
     // To bench with this on 3970x:
     // RUSTFLAG="-C target-cpu=native -g" taskset -c 0,40 cargo bench
-    fn eval_rtl(&mut self, x: RoundValue<pallas::Scalar>, t: u64) -> RoundValue<pallas::Scalar> {
+    fn eval_rtl(&mut self, x: State<pallas::Scalar>, t: u64) -> State<pallas::Scalar> {
         let bit_count = Self::bit_count();
         let squares1 = Arc::new(UnsafeCell::new(vec![[0u64; 4]; 254].into_boxed_slice()));
         let sq = Sq(squares1);
@@ -113,13 +113,14 @@ impl PallasVDF {
                         squares[$index] = $val;
                         ready.store($index, Ordering::SeqCst)
                     };
-                };
+                }
 
                 for _ in 0..t {
                     while ready.load(Ordering::SeqCst) != 0 {}
 
                     let mut next_square = squares[0];
 
+                    #[allow(clippy::needless_range_loop)]
                     for i in 0..Self::bit_count() {
                         if i > 0 {
                             next_square = next_square.square();
@@ -138,9 +139,9 @@ impl PallasVDF {
     // RUSTFLAG="-C target-cpu=native -g" taskset -c 0,40 cargo bench
     fn eval_rtl_addition_chain(
         &mut self,
-        x: RoundValue<pallas::Scalar>,
+        x: State<pallas::Scalar>,
         t: u64,
-    ) -> RoundValue<pallas::Scalar> {
+    ) -> State<pallas::Scalar> {
         let bit_count = Self::bit_count();
         let squares1 = Arc::new(UnsafeCell::new(vec![[0u64; 4]; 254].into_boxed_slice()));
         let sq = Sq(squares1);
@@ -161,7 +162,7 @@ impl PallasVDF {
                         squares[$index] = $val;
                         ready.store($index, Ordering::SeqCst)
                     };
-                };
+                }
 
                 for _ in 0..t {
                     while ready.load(Ordering::SeqCst) != 0 {}
@@ -170,6 +171,7 @@ impl PallasVDF {
 
                     let first_section_bit_count = 128;
 
+                    #[allow(clippy::needless_range_loop)]
                     for i in 0..first_section_bit_count {
                         if i > 0 {
                             next_square = next_square.square();
@@ -206,28 +208,25 @@ impl PallasVDF {
     #[inline]
     fn round_with_squares(
         &mut self,
-        x: RoundValue<pallas::Scalar>,
+        x: State<pallas::Scalar>,
         squares: &Sq,
         ready: &Arc<AtomicUsize>,
-    ) -> RoundValue<pallas::Scalar> {
-        RoundValue {
-            // Increment the value by the round number so problematic values
-            // like 0 and 1 don't consistently defeat the asymmetry.
-            value: match self.eval_mode {
+    ) -> State<pallas::Scalar> {
+        State {
+            x: match self.eval_mode {
                 EvalMode::RTLParallel => self.forward_step_with_squares_naive_rtl(
-                    pallas::Scalar::add(&x.value, &x.round),
+                    pallas::Scalar::add(&x.x, &x.y),
                     squares,
                     ready,
                 ),
-                EvalMode::RTLAddChainParallel => self.forward_step_with_squares(
-                    pallas::Scalar::add(&x.value, &x.round),
-                    squares,
-                    ready,
-                ),
-                _ => panic!("fell through in round_with_squares"),
+                EvalMode::RTLAddChainParallel => {
+                    self.forward_step_with_squares(pallas::Scalar::add(&x.x, &x.y), squares, ready)
+                }
+                _ => panic!("fell through in y_with_squares"),
             },
             // Increment the round.
-            round: pallas::Scalar::add(&x.round, &pallas::Scalar::one()),
+            y: pallas::Scalar::add(&x.x, &x.i),
+            i: pallas::Scalar::add(&x.i, &pallas::Scalar::one()),
         }
     }
 
@@ -365,8 +364,7 @@ impl PallasVDF {
         let qr32q = sqr_mul(qr32p, 4, q1001);
         let qr32r = sqr_mul(qr32q, 6, q101);
         let qr32s = sqr_mul(qr32r, 37, qr8);
-        let qr32t = sqr_mul(qr32s, 2, q1);
-        qr32t
+        sqr_mul(qr32s, 2, q1)
     }
 
     // Sequential RTL square-and-multiply.
@@ -422,7 +420,7 @@ impl PallasVDF {
         let square_acc = square_acc.mul(&square_acc.square());
         let square_acc = square_acc.mul(&square_acc.square().square().square().square());
 
-        let acc = (0..122)
+        (0..122)
             .scan(square_acc, |state, _| {
                 *state = (*state).square();
 
@@ -435,15 +433,14 @@ impl PallasVDF {
                     (acc, count + 1)
                 }
             })
-            .0;
-        acc
+            .0
     }
 }
 
 /// Modulus is that of `Fp`, which is the base field of `Pallas and scalar field of Vesta.
 #[derive(Debug)]
 pub struct VestaVDF {}
-impl RaguVDF<vesta::Scalar> for VestaVDF {
+impl MinRootVDF<vesta::Scalar> for VestaVDF {
     fn new_with_mode(_eval_mode: EvalMode) -> Self {
         VestaVDF {}
     }
@@ -492,8 +489,7 @@ impl RaguVDF<vesta::Scalar> for VestaVDF {
         let pr32p = sqr_mul(pr32o, 6, p1111);
         let pr32q = sqr_mul(pr32p, 2, p11);
         let pr32r = sqr_mul(pr32q, 34, pr8);
-        let pr32s = sqr_mul(pr32r, 2, p1);
-        pr32s
+        sqr_mul(pr32r, 2, p1)
     }
 }
 
@@ -501,12 +497,13 @@ impl RaguVDF<vesta::Scalar> for VestaVDF {
 pub type TargetVDF<'a> = PallasVDF;
 
 #[derive(std::cmp::PartialEq, Debug, Clone, Copy)]
-pub struct RoundValue<T> {
-    pub value: T,
-    pub round: T,
+pub struct State<T> {
+    pub x: T,
+    pub y: T,
+    pub i: T,
 }
 
-pub trait RaguVDF<F>: Debug
+pub trait MinRootVDF<F>: Debug
 where
     F: FieldExt,
 {
@@ -554,43 +551,42 @@ where
     }
 
     /// one round in the slow/forward direction.
-    fn round(&mut self, x: RoundValue<F>) -> RoundValue<F> {
-        RoundValue {
-            // Increment the value by the round number so problematic values
-            // like 0 and 1 don't consistently defeat the asymmetry.
-            value: self.forward_step(F::add(x.value, x.round)),
-            // Increment the round.
-            round: F::add(x.round, F::one()),
+    fn round(&mut self, s: State<F>) -> State<F> {
+        State {
+            x: self.forward_step(F::add(s.x, s.y)),
+            y: F::add(s.x, s.i),
+            i: F::add(s.i, F::one()),
         }
     }
 
     /// One round in the fast/inverse direction.
-    fn inverse_round(x: RoundValue<F>) -> RoundValue<F> {
-        RoundValue {
-            value: F::add(F::sub(Self::inverse_step(x.value), x.round), F::one()),
-            round: F::sub(x.round, F::one()),
-        }
+    fn inverse_round(s: State<F>) -> State<F> {
+        let i = F::sub(s.i, &F::one());
+        let x = F::sub(s.y, &i);
+        let mut y = Self::inverse_step(s.x);
+        y.sub_assign(&x);
+        State { x, y, i }
     }
 
     /// Evaluate input `x` with time/difficulty parameter, `t` in the
     /// slow/forward direction.
-    fn eval(&mut self, x: RoundValue<F>, t: u64) -> RoundValue<F> {
+    fn eval(&mut self, x: State<F>, t: u64) -> State<F> {
         self.simple_eval(x, t)
     }
 
-    fn simple_eval(&mut self, x: RoundValue<F>, t: u64) -> RoundValue<F> {
+    fn simple_eval(&mut self, x: State<F>, t: u64) -> State<F> {
         (0..t).fold(x, |acc, _| self.round(acc))
     }
 
     /// Invert evaluation of output `x` with time/difficulty parameter, `t` in
     /// the fast/inverse direction.
-    fn inverse_eval(x: RoundValue<F>, t: u64) -> RoundValue<F> {
+    fn inverse_eval(x: State<F>, t: u64) -> State<F> {
         (0..t).fold(x, |acc, _| Self::inverse_round(acc))
     }
 
     /// Quickly check that `result` is the result of having slowly evaluated
     /// `original` with time/difficulty parameter `t`.
-    fn check(result: RoundValue<F>, t: u64, original: RoundValue<F>) -> bool {
+    fn check(result: State<F>, t: u64, original: State<F>) -> bool {
         original == Self::inverse_eval(result, t)
     }
 
@@ -598,14 +594,14 @@ where
 }
 
 #[derive(Debug)]
-pub struct VanillaVDFProof<V: RaguVDF<F> + Debug, F: FieldExt> {
-    result: RoundValue<F>,
+pub struct VanillaVDFProof<V: MinRootVDF<F> + Debug, F: FieldExt> {
+    result: State<F>,
     t: u64,
     _v: PhantomData<V>,
 }
 
-impl<V: RaguVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
-    pub fn eval_and_prove(x: RoundValue<F>, t: u64) -> Self {
+impl<V: MinRootVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
+    pub fn eval_and_prove(x: State<F>, t: u64) -> Self {
         let mut vdf = V::new();
         let result = vdf.eval(x, t);
         Self {
@@ -615,7 +611,7 @@ impl<V: RaguVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
         }
     }
 
-    pub fn eval_and_prove_with_mode(eval_mode: EvalMode, x: RoundValue<F>, t: u64) -> Self {
+    pub fn eval_and_prove_with_mode(eval_mode: EvalMode, x: State<F>, t: u64) -> Self {
         let mut vdf = V::new_with_mode(eval_mode);
         let result = vdf.eval(x, t);
         Self {
@@ -625,11 +621,11 @@ impl<V: RaguVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
         }
     }
 
-    pub fn result(&self) -> RoundValue<F> {
+    pub fn result(&self) -> State<F> {
         self.result
     }
 
-    pub fn verify(&self, original: RoundValue<F>) -> bool {
+    pub fn verify(&self, original: State<F>) -> bool {
         V::check(self.result, self.t, original)
     }
 
@@ -658,7 +654,7 @@ mod tests {
         test_exponents_aux::<VestaVDF, vesta::Scalar>();
     }
 
-    fn test_exponents_aux<V: RaguVDF<F>, F: FieldExt>() {
+    fn test_exponents_aux<V: MinRootVDF<F>, F: FieldExt>() {
         assert_eq!(V::inverse_exponent(), 5);
         assert_eq!(V::inverse_exponent(), 5);
     }
@@ -669,7 +665,7 @@ mod tests {
         test_steps_aux::<VestaVDF, vesta::Scalar>();
     }
 
-    fn test_steps_aux<V: RaguVDF<F>, F: FieldExt>() {
+    fn test_steps_aux<V: MinRootVDF<F>, F: FieldExt>() {
         let mut rng = XorShiftRng::from_seed(TEST_SEED);
         let mut vdf = V::new();
 
@@ -688,26 +684,26 @@ mod tests {
         test_eval_aux::<PallasVDF, pallas::Scalar>();
     }
 
-    fn test_eval_aux<V: RaguVDF<F>, F: FieldExt>() {
+    fn test_eval_aux<V: MinRootVDF<F>, F: FieldExt>() {
         for mode in EvalMode::all().iter() {
             test_eval_aux2::<V, F>(*mode)
         }
     }
 
-    fn test_eval_aux2<V: RaguVDF<F>, F: FieldExt>(eval_mode: EvalMode) {
+    fn test_eval_aux2<V: MinRootVDF<F>, F: FieldExt>(eval_mode: EvalMode) {
         let mut rng = XorShiftRng::from_seed(TEST_SEED);
         let mut vdf = V::new_with_mode(eval_mode);
 
-        for _ in 0..1 {
+        for _ in 0..10 {
             let t = 10;
-            let value = F::random(&mut rng);
-            let round = F::random(&mut rng);
-            let x = RoundValue { value, round };
-            let y = vdf.eval(x, t);
-            let z = V::inverse_eval(y, t);
+            let x = F::random(&mut rng);
+            let y = F::random(&mut rng);
+            let x = State { x, y, i: F::zero() };
+            let result = vdf.eval(x, t);
+            let again = V::inverse_eval(result, t);
 
-            assert_eq!(x, z);
-            assert!(V::check(y, t, x));
+            assert_eq!(x, again);
+            assert!(V::check(result, t, x));
         }
     }
 
@@ -717,12 +713,12 @@ mod tests {
         test_vanilla_proof_aux::<VestaVDF, vesta::Scalar>();
     }
 
-    fn test_vanilla_proof_aux<V: RaguVDF<F>, F: FieldExt>() {
+    fn test_vanilla_proof_aux<V: MinRootVDF<F>, F: FieldExt>() {
         let mut rng = XorShiftRng::from_seed(TEST_SEED);
 
-        let value = F::random(&mut rng);
-        let round = F::zero();
-        let x = RoundValue { value, round };
+        let x = F::random(&mut rng);
+        let y = F::zero();
+        let x = State { x, y, i: F::zero() };
         let t = 12;
         let n = 11;
 
@@ -733,7 +729,7 @@ mod tests {
             acc.append(new_proof).expect("failed to append proof")
         });
 
-        assert_eq!(V::element(final_proof.t), final_proof.result.round);
+        assert_eq!(V::element(final_proof.t), final_proof.result.i);
         assert_eq!(n * t, final_proof.t);
         assert!(final_proof.verify(x));
     }
