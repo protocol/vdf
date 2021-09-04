@@ -8,8 +8,6 @@ use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-pub const TEST_SEED: [u8; 16] = [42; 16];
-
 // Question: Should the naming of `PallasVDF` and `VestaVDF` be reversed?
 
 #[derive(Debug, Clone, Copy)]
@@ -595,9 +593,18 @@ where
 
 #[derive(Debug)]
 pub struct VanillaVDFProof<V: MinRootVDF<F> + Debug, F: FieldExt> {
-    result: State<F>,
-    t: u64,
+    pub result: State<F>,
+    pub t: u64,
     _v: PhantomData<V>,
+}
+impl<V: MinRootVDF<F>, F: FieldExt> Clone for VanillaVDFProof<V, F> {
+    fn clone(&self) -> Self {
+        Self {
+            result: self.result.clone(),
+            t: self.t,
+            _v: PhantomData::<V>::default(),
+        }
+    }
 }
 
 impl<V: MinRootVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
@@ -645,6 +652,7 @@ impl<V: MinRootVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TEST_SEED;
     use rand::SeedableRng;
     use rand_xorshift::XorShiftRng;
 
@@ -724,7 +732,7 @@ mod tests {
 
         let first_proof = VanillaVDFProof::<V, F>::eval_and_prove(x, t);
 
-        let final_proof = (1..11).fold(first_proof, |acc, _| {
+        let final_proof = (1..n).fold(first_proof, |acc, _| {
             let new_proof = VanillaVDFProof::<V, F>::eval_and_prove(acc.result, t);
             acc.append(new_proof).expect("failed to append proof")
         });

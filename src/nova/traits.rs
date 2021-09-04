@@ -42,12 +42,10 @@ impl Group for PallasPoint {
 
     fn from_uniform_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != 64 {
-            dbg!(bytes.len());
             None
         } else {
             let mut arr = [0; 32];
             arr.copy_from_slice(&bytes[0..32]);
-            dbg!(&arr);
 
             let hash = Ep::hash_to_curve("from_uniform_bytes");
             Some(Self(hash(&arr)))
@@ -74,6 +72,12 @@ impl PrimeField for PallasScalar {
 
     fn random(_rng: &mut (impl RngCore + CryptoRng)) -> Self {
         Self(Fq::rand())
+    }
+}
+
+impl From<Fq> for PallasScalar {
+    fn from(s: Fq) -> Self {
+        Self(s)
     }
 }
 

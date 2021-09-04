@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use pasta_curves::arithmetic::FieldExt;
 use pasta_curves::{pallas, vesta};
-use vdf::{EvalMode, MinRootVDF, PallasVDF, State, VanillaVDFProof, VestaVDF};
+use vdf::minroot::{EvalMode, MinRootVDF, PallasVDF, State, VanillaVDFProof, VestaVDF};
 
 fn bench_eval<V: MinRootVDF<F>, F: FieldExt>(eval_mode: EvalMode, c: &mut Criterion, name: &str) {
     let t = 10000;
