@@ -110,7 +110,7 @@ jobs:
       - set-env-path
       - run:
           name: Run cargo clippy
-          command: cargo +$(cat rust-toolchain) clippy --all-targets --all-features --workspace
+          command: cargo +$(cat rust-toolchain) clippy --all-targets --all-features --workspace -- -D warnings
 
   test:
     executor: default
