@@ -12,6 +12,7 @@ type MainGroup = PallasPoint;
 
 pub struct NovaVDFProof {
     final_proof: FinalSNARK<MainGroup>,
+    final_instance: R1CSInstance<MainGroup>,
 }
 
 #[derive(Debug)]
@@ -94,7 +95,10 @@ fn make_nova_proof<S: Into<PallasScalar> + Clone>(
     // now, skip all that. Given that we will never actually use this
     // non-recursive verification strategy, should we even bother, or just wait for
     // recursion?
-    let proof = NovaVDFProof { final_proof };
+    let proof = NovaVDFProof {
+        final_proof,
+        final_instance: acc_U.clone(),
+    };
 
     assert!(proof.verify(gens, S, &acc_U));
 
@@ -204,10 +208,6 @@ fn make_nova_r1cs(
     // I4 = x_n
     // I5 = y_n
 
-    //// Z0 = i_0
-    //// Z1 = x_0
-    //// Z2 = y_0
-
     // Z0 = I0 - 1 = i_1
     // Z1 = I2 - 1 = x_1
     // Z2 = Z1 * Z1
@@ -248,80 +248,92 @@ fn make_nova_r1cs(
     // let mut y_index = num_vars + 3; // I2
 
     // Add constraints and construct witness
-    let mut add_step_constraints = || {
-        let w = witness.len();
-        let (i, x, y, i_index, x_index, y_index) = if w == 0 {
-            (
-                result_i,
-                result_x,
-                result_y,
-                num_vars + 1,
-                num_vars + 2,
-                num_vars + 3,
-            )
-        } else {
-            assert_eq!(0, w % 5);
-            (
-                witness[w - 5],
-                witness[w - 4],
-                witness[w - 1],
-                w - 5,
-                w - 4,
-                w - 1,
-            )
-        };
-
-        let new_i = i - one;
+    let mut add_step_constraints = |i_index, x_index, y_index, w| {
         add_constraint(
             &mut X,
             vec![(i_index, one), (one_index, neg_one)],
             vec![(one_index, one)],
             vec![(w, one)],
         );
-        witness.push(new_i);
 
-        let new_x = y - one;
         add_constraint(
             &mut X,
             vec![(y_index, one), (one_index, neg_one)],
             vec![(one_index, one)],
             vec![(w + 1, one)],
         );
-        witness.push(new_x);
 
-        let mut new_y = x * x;
         add_constraint(
             &mut X,
             vec![(x_index, one)],
             vec![(x_index, one)],
             vec![(w + 2, one)],
         );
-        witness.push(new_y);
 
-        new_y *= new_y;
         add_constraint(
             &mut X,
             vec![(w + 2, one)],
             vec![(w + 2, one)],
             vec![(w + 3, one)],
         );
-        witness.push(new_y);
 
-        new_y *= x;
         add_constraint(
             &mut X,
             vec![(w + 3, one)],
             vec![(x_index, one)],
             vec![(w + 4, one)],
         );
-        witness.push(new_y);
     };
 
-    for _ in 0..t {
-        add_step_constraints();
+    let mut add_step_witnesses = |i: &PallasScalar, x: &PallasScalar, y: &PallasScalar| {
+        let new_i = *i - one;
+        witness.push(new_i);
+
+        let new_x = *y - one;
+        witness.push(new_x);
+
+        let mut new_y = *x * *x;
+        witness.push(new_y);
+
+        new_y *= new_y;
+        witness.push(new_y);
+
+        new_y *= x;
+        witness.push(new_y);
+
+        (new_i, new_x, new_y)
+    };
+
+    {
+        let mut w = 0;
+        let mut i = result_i;
+        let mut x = result_x;
+        let mut y = result_y;
+
+        for _ in 0..t {
+            let (i_index, x_index, y_index) = if w == 0 {
+                (num_vars + 1, num_vars + 2, num_vars + 3)
+            } else {
+                assert_eq!(0, w % 5);
+                (w - 5, w - 4, w - 1)
+            };
+
+            add_step_constraints(i_index, x_index, y_index, w);
+            let (new_i, new_x, new_y) = add_step_witnesses(&i, &x, &y);
+
+            i = new_i;
+            x = new_x;
+            y = new_y;
+
+            w += 5;
+        }
     }
 
-    let mut add_final_constraints = || {
+    let add_final_constraints = || {
+        // TODO: Add equality constraints or else optimize away the witness allocations.
+    };
+
+    let mut add_final_witnesses = || {
         let w = witness.len();
         inputs.push(result_i);
         inputs.push(result_x);
@@ -333,18 +345,11 @@ fn make_nova_r1cs(
     };
 
     add_final_constraints();
+    add_final_witnesses();
 
     assert_eq!(witness.len(), num_vars);
 
-    // create a shape object
-    let S: R1CSShape<MainGroup> = {
-        let res = R1CSShape::new(num_cons, num_vars, num_inputs, &A, &B, &C);
-        assert!(res.is_ok());
-        res.unwrap()
-    };
-
-    // generate generators
-    let gens: R1CSGens<MainGroup> = R1CSGens::new(num_cons, num_vars);
+    let (S, gens) = make_nova_shape_and_gens(num_cons, num_vars, num_inputs, A, B, C);
 
     let W = {
         let E = vec![PallasScalar::zero(); num_cons]; // default E
@@ -570,6 +575,7 @@ mod test {
                 t: p.t,
             })
             .collect();
+
         let nova_proof = make_nova_proof(raw_vanilla_proofs);
     }
 }
