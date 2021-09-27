@@ -5,4 +5,3 @@
     clippy::type_complexity
 )]
 pub mod proof;
-pub mod traits;

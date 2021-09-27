@@ -2,11 +2,14 @@ use merlin::Transcript;
 use nova::r1cs::{R1CSGens, R1CSInstance, R1CSShape, R1CSWitness};
 use nova::traits::PrimeField;
 use pasta_curves::arithmetic::FieldExt;
+use pasta_curves::pallas;
 
-use super::traits::{PallasPoint, PallasScalar};
 use crate::minroot::{MinRootVDF, State, VanillaVDFProof};
 
 use nova::{FinalSNARK, StepSNARK};
+
+type PallasPoint = pallas::Point;
+type PallasScalar = pallas::Scalar;
 
 type MainGroup = PallasPoint;
 
@@ -22,7 +25,6 @@ struct RawVanillaProof<S> {
     pub t: u64,
 }
 
-//impl<F: PrimeField + Into<PallasScalar>> RawVanillaProof<F> {
 impl<F: Clone + Into<PallasScalar>> RawVanillaProof<F> {
     fn make_nova_r1cs(
         &self,
@@ -396,7 +398,6 @@ fn add_constraint<S: PrimeField>(
 
 #[cfg(test)]
 mod test {
-    use super::super::traits::{PallasPoint, PallasScalar};
     use super::*;
     use crate::minroot::{PallasVDF, State};
     use crate::TEST_SEED;
@@ -543,7 +544,7 @@ mod test {
 
         type F = pallas::Scalar;
 
-        let x = F::random(&mut rng);
+        let x = Field::random(&mut rng);
         let y = F::zero();
         let x = State { x, y, i: F::zero() };
         let t = 11;
@@ -576,6 +577,6 @@ mod test {
             })
             .collect();
 
-        let nova_proof = make_nova_proof(raw_vanilla_proofs);
+        let _nova_proof = make_nova_proof(raw_vanilla_proofs);
     }
 }
