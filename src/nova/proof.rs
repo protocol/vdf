@@ -1,3 +1,8 @@
+use bellperson::nova::metric_cs::MetricCS;
+use bellperson::nova::prover::ProvingAssignment;
+use bellperson::nova::r1cs::{NovaShape, NovaWitness};
+
+use bellperson::{Circuit, ConstraintSystem, SynthesisError};
 use merlin::Transcript;
 use nova::r1cs::{R1CSGens, R1CSInstance, R1CSShape, R1CSWitness};
 use nova::traits::PrimeField;
@@ -25,6 +30,13 @@ struct RawVanillaProof<S> {
     pub t: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RawVanillaProofPallas {
+    pub inverse_exponent: u64,
+    pub result: State<PallasScalar>,
+    pub t: u64,
+}
+
 impl<F: Clone + Into<PallasScalar>> RawVanillaProof<F> {
     fn make_nova_r1cs(
         &self,
@@ -32,13 +44,238 @@ impl<F: Clone + Into<PallasScalar>> RawVanillaProof<F> {
         (R1CSInstance<PallasPoint>, R1CSWitness<PallasPoint>),
         (R1CSShape<MainGroup>, R1CSGens<MainGroup>),
     ) {
-        make_nova_r1cs(
-            self.inverse_exponent,
-            self.t,
-            self.result.i.clone().into(),
-            self.result.x.clone().into(),
-            self.result.y.clone().into(),
-        )
+        let result_i = self.result.i.clone().into();
+        let result_x = self.result.x.clone().into();
+        let result_y = self.result.y.clone().into();
+        let Self { t, .. } = *self;
+
+        let one = PrimeField::one();
+        let zero: PallasScalar = PrimeField::zero();
+        let neg_one = zero - one;
+
+        let mut num_cons = 0;
+        let num_vars = 5 * t as usize;
+        let num_inputs = 6;
+
+        // For legibility: z[num_vars] = one.
+        let one_index = num_vars;
+
+        let mut witness: Vec<PallasScalar> = Vec::new();
+        let mut inputs: Vec<PallasScalar> = Vec::new();
+
+        let mut A: Vec<(usize, usize, PallasScalar)> = Vec::new();
+        let mut B: Vec<(usize, usize, PallasScalar)> = Vec::new();
+        let mut C: Vec<(usize, usize, PallasScalar)> = Vec::new();
+
+        let mut X = (&mut A, &mut B, &mut C, &mut num_cons);
+
+        // One step:
+        // i_n+1 = i_n - 1
+        // x_n+1 = y_n - 1
+        // y_n+1 = x_n^5
+
+        // I0 = i_0
+        // I1 = x_0
+        // I2 = y_0
+        // I3 = i_n
+        // I4 = x_n
+        // I5 = y_n
+
+        // Z0 = I0 - 1 = i_1
+        // Z1 = I2 - 1 = x_1
+        // Z2 = Z1 * Z1
+        // Z3 = Z2 * Z2
+        // Z4 = Z3 * Z1 = y_1
+
+        // when n > 0, i_n = Zk: k = 0 + 5(n-1)
+        // when n > 0, x_n = Zk: k = 1 + 5(n-1)
+        // when n > 0, y_n = Zk: k = 4 + 5(n-1)
+
+        // R1CS
+
+        // Initial:
+        // (I0 - 1) * 1 - Z0 = 0
+        // (I2 - 1) * 1 - Z1 = 0
+        // I1 * I1 - Z2 = 0
+        // Z2 * Z2 - Z3 = 0
+        // Z3 * Z1 - Z4 = 0
+
+        // Repeated:
+        // (Z0 - 1) * 1 - Z5 = 0
+        // (Z2 - 1) * 1 - Z6 = 0
+        // Z1 * Z1 - Z7 = 0
+        // Z7 * Z7 - Z8 = 0
+        // Z8 * Z1 - Z9 = 0
+
+        // Repeat, t-1 times.
+
+        // Witness is:
+        // Z0 Z1 Z2 ... Zn-1 One I0 I1 I2 I3 I4
+        //
+        // Z0 = W[0]
+        // One = W[num_vars]
+        // I0 = W[num_vars + 1]
+
+        // let mut i_index = num_vars + 1; // I0
+        //                                 //    let mut x_index = num_vars + 2; // I1
+        // let mut y_index = num_vars + 3; // I2
+
+        // Add constraints and construct witness
+        let mut add_step_constraints = |i_index, x_index, y_index, w| {
+            add_constraint(
+                &mut X,
+                vec![(i_index, one), (one_index, neg_one)],
+                vec![(one_index, one)],
+                vec![(w, one)],
+            );
+
+            add_constraint(
+                &mut X,
+                vec![(y_index, one), (one_index, neg_one)],
+                vec![(one_index, one)],
+                vec![(w + 1, one)],
+            );
+
+            add_constraint(
+                &mut X,
+                vec![(x_index, one)],
+                vec![(x_index, one)],
+                vec![(w + 2, one)],
+            );
+
+            add_constraint(
+                &mut X,
+                vec![(w + 2, one)],
+                vec![(w + 2, one)],
+                vec![(w + 3, one)],
+            );
+
+            add_constraint(
+                &mut X,
+                vec![(w + 3, one)],
+                vec![(x_index, one)],
+                vec![(w + 4, one)],
+            );
+        };
+
+        let mut add_step_witnesses = |i: &PallasScalar, x: &PallasScalar, y: &PallasScalar| {
+            let new_i = *i - one;
+            witness.push(new_i);
+
+            let new_x = *y - one;
+            witness.push(new_x);
+
+            let mut new_y = *x * *x;
+            witness.push(new_y);
+
+            new_y *= new_y;
+            witness.push(new_y);
+
+            new_y *= x;
+            witness.push(new_y);
+
+            (new_i, new_x, new_y)
+        };
+
+        {
+            let mut w = 0;
+            let mut i = result_i;
+            let mut x = result_x;
+            let mut y = result_y;
+
+            for _ in 0..t {
+                let (i_index, x_index, y_index) = if w == 0 {
+                    (num_vars + 1, num_vars + 2, num_vars + 3)
+                } else {
+                    assert_eq!(0, w % 5);
+                    (w - 5, w - 4, w - 1)
+                };
+
+                add_step_constraints(i_index, x_index, y_index, w);
+                let (new_i, new_x, new_y) = add_step_witnesses(&i, &x, &y);
+
+                i = new_i;
+                x = new_x;
+                y = new_y;
+
+                w += 5;
+            }
+        }
+
+        let add_final_constraints = || {
+            // TODO: Add equality constraints or else optimize away the witness allocations.
+        };
+
+        let mut add_final_witnesses = || {
+            let w = witness.len();
+            inputs.push(result_i);
+            inputs.push(result_x);
+            inputs.push(result_y);
+            // FIXME: Add equality constraints or else optimize away the witness allocations.
+            inputs.push(witness[w - 5]);
+            inputs.push(witness[w - 4]);
+            inputs.push(witness[w - 1]);
+        };
+
+        add_final_constraints();
+        add_final_witnesses();
+
+        assert_eq!(witness.len(), num_vars);
+
+        let (S, gens) = make_nova_shape_and_gens(num_cons, num_vars, num_inputs, A, B, C);
+
+        let W = {
+            let E = vec![PallasScalar::zero(); num_cons]; // default E
+            let res = R1CSWitness::new(&S, &witness, &E);
+            assert!(res.is_ok());
+            res.unwrap()
+        };
+        let U = {
+            let (comm_W, comm_E) = W.commit(&gens);
+            let u = PallasScalar::one(); //default u
+            let res = R1CSInstance::new(&S, &comm_W, &comm_E, &inputs, &u);
+            assert!(res.is_ok());
+            res.unwrap()
+        };
+        ((U, W), (S, gens))
+    }
+}
+
+impl RawVanillaProofPallas {
+    fn make_nova_r1cs_with_bellman(
+        self,
+    ) -> (
+        (R1CSInstance<PallasPoint>, R1CSWitness<PallasPoint>),
+        (R1CSShape<MainGroup>, R1CSGens<MainGroup>),
+    ) {
+        let mut cs = ProvingAssignment::<PallasPoint>::new();
+        self.clone().synthesize(&mut cs).unwrap();
+
+        let (shape, gens) = self.make_nova_shape_and_gens_with_bellman();
+
+        let instance = cs.r1cs_instance();
+        let witness = cs.r1cs_witness();
+
+        ((instance, witness), (shape, gens))
+    }
+
+    fn make_nova_shape_and_gens_with_bellman(&self) -> (R1CSShape<MainGroup>, R1CSGens<MainGroup>) {
+        let mut cs = MetricCS::<MainGroup>::new();
+        self.synthesize(&mut cs).unwrap();
+
+        let shape = cs.r1cs_shape().into();
+        let gens = cs.r1cs_gens().into();
+
+        (shape, gens)
+    }
+}
+
+impl Circuit<PallasScalar> for RawVanillaProofPallas {
+    fn synthesize<CS>(self, _: &mut CS) -> Result<(), SynthesisError>
+    where
+        CS: ConstraintSystem<PallasScalar>,
+    {
+        todo!()
     }
 }
 
@@ -67,7 +304,7 @@ fn make_nova_proof<S: Into<PallasScalar> + Clone>(
     //assert!(r1cs_instances.len() > 1);
 
     let mut step_proofs = Vec::new();
-    let mut prover_transcript = Transcript::new(b"StepSNARKExample");
+    let mut prover_transcript = Transcript::new(b"MinRootPallas");
 
     let (S, gens) = &r1cs_instances[0].1;
     let initial_acc = r1cs_instances[0].0.clone();
@@ -511,13 +748,13 @@ mod test {
         let (U2, W2) = rand_inst_witness_generator(&gens);
 
         // produce a step SNARK
-        let mut prover_transcript = Transcript::new(b"StepSNARKExample");
+        let mut prover_transcript = Transcript::new(b"MinRootPallas");
         let res = StepSNARK::prove(&gens, &S, &U1, &W1, &U2, &W2, &mut prover_transcript);
         assert!(res.is_ok());
         let (step_snark, (_U, W)) = res.unwrap();
 
         // verify the step SNARK
-        let mut verifier_transcript = Transcript::new(b"StepSNARKExample");
+        let mut verifier_transcript = Transcript::new(b"MinRootPallas");
         let res = step_snark.verify(&U1, &U2, &mut verifier_transcript);
         assert!(res.is_ok());
         let U = res.unwrap();
