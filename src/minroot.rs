@@ -585,9 +585,14 @@ where
     }
 
     fn simple_eval(&mut self, x: State<F>, t: u64) -> (State<F>, Option<Vec<State<F>>>) {
-        let mut intermediates = Some(Vec::with_capacity(t as usize));
+        // TODO: Add ability to generate intermediates (and how many) or not.
+        // For now, default to None. To return all for dev/testing, uncomment the next line.
+
+        // let mut intermediates = Some(Vec::with_capacity(t as usize));
+
+        let mut intermediates: Option<Vec<_>> = None;
         let mut acc = x;
-        for i in 0..t {
+        for _ in 0..t {
             if let Some(ref mut intermediates) = intermediates {
                 intermediates.push(acc)
             };
@@ -623,7 +628,7 @@ pub struct VanillaVDFProof<V: MinRootVDF<F> + Debug, F: FieldExt> {
 impl<V: MinRootVDF<F>, F: FieldExt> Clone for VanillaVDFProof<V, F> {
     fn clone(&self) -> Self {
         Self {
-            result: self.result.clone(),
+            result: self.result,
             t: self.t,
             intermediates: self.intermediates.clone(),
             _v: PhantomData::<V>::default(),
@@ -742,7 +747,7 @@ mod tests {
             let x = F::random(&mut rng);
             let y = F::random(&mut rng);
             let x = State { x, y, i: F::zero() };
-            let (result, intermediates) = vdf.eval(x, t);
+            let (result, _intermediates) = vdf.eval(x, t);
             let again = V::inverse_eval(result, t);
 
             assert_eq!(x, again);
@@ -763,7 +768,7 @@ mod tests {
         let y = F::zero();
         let x = State { x, y, i: F::zero() };
         let t = 4;
-        let n = 2;
+        let n = 3;
 
         let first_proof = VanillaVDFProof::<V, F>::eval_and_prove(x, t);
 

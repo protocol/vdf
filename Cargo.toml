@@ -6,13 +6,12 @@ edition = "2018"
 
 [dependencies]
 #bellperson = "0.17.0"
-bellperson =  { path = "../bellman", package = "bellperson", features = ["nova"]}
+bellperson =  { git = "https://github.com/filecoin-project/bellperson", branch = "nova", features = ["nova"]}
 crossbeam = "0.8"
 
 ff = "0.11.0"
 merlin = "2.0.0"
-nova = { git = "https://github.com/microsoft/Nova", package = "nova-snark", branch = "main" }
-#nova = { version = "0.2", package = "nova-snark" }
+nova = { version = "0.3", package = "nova-snark" }
 pairing = "0.21"
 pasta_curves = "0.2.1"
 rand = "0.8"

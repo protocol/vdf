@@ -1,249 +1,84 @@
-// use bellperson::nova::metric_cs::MetricCS;
-// use bellperson::nova::prover::ProvingAssignment;
-// use bellperson::nova::r1cs::{NovaShape, NovaWitness};
+use std::fmt::Debug;
 
-// use bellperson::{Circuit, ConstraintSystem, SynthesisError};
-use merlin::Transcript;
-use nova::r1cs::{
-    R1CSGens, R1CSInstance, R1CSShape, R1CSWitness, RelaxedR1CSInstance, RelaxedR1CSWitness,
+use bellperson::{
+    gadgets::num::AllocatedNum,
+    nova::{
+        prover::ProvingAssignment,
+        r1cs::{NovaShape, NovaWitness},
+        shape_cs::ShapeCS,
+    },
+    Circuit, ConstraintSystem, SynthesisError,
 };
-use nova::traits::PrimeField;
-use pasta_curves::arithmetic::FieldExt;
-use pasta_curves::pallas;
+
+use merlin::Transcript;
+use nova::{
+    errors::NovaError,
+    r1cs::{
+        R1CSGens, R1CSInstance, R1CSShape, R1CSWitness, RelaxedR1CSInstance, RelaxedR1CSWitness,
+    },
+    traits::PrimeField,
+};
+
+use pasta_curves::{arithmetic::FieldExt, pallas};
 
 use crate::minroot::{MinRootVDF, State, VanillaVDFProof};
 
 use nova::{FinalSNARK, StepSNARK};
 
-type PallasPoint = pallas::Point;
-type PallasScalar = pallas::Scalar;
+pub type PallasPoint = pallas::Point;
+pub type PallasScalar = pallas::Scalar;
 
-type MainGroup = PallasPoint;
+pub type PallasGroup = PallasPoint;
 
 pub struct NovaVDFProof {
-    final_proof: FinalSNARK<MainGroup>,
-    final_instance: RelaxedR1CSInstance<MainGroup>,
+    final_proof: FinalSNARK<PallasGroup>,
+    final_instance: RelaxedR1CSInstance<PallasGroup>,
 }
 
-#[derive(Debug)]
-struct RawVanillaProof<S>
+#[derive(Clone, Debug, Default)]
+pub struct RawVanillaProof<S>
 where
-    S: std::fmt::Debug,
+    S: Debug,
 {
     pub inverse_exponent: u64,
-    pub result: State<S>,
+    pub result: Option<State<S>>,
     pub intermediates: Option<Vec<State<S>>>,
     pub t: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RawVanillaProofPallas {
-    pub inverse_exponent: u64,
-    pub result: State<PallasScalar>,
-    pub t: u64,
+impl<S: Debug + Default> RawVanillaProof<S> {
+    pub fn new_empty(t: u64) -> Self {
+        Self {
+            inverse_exponent: 5,
+            result: None,
+            intermediates: None,
+            t,
+        }
+    }
 }
 
-impl<F: Copy + Clone + Into<PallasScalar> + std::fmt::Debug> RawVanillaProof<F> {
-    fn make_nova_r1cs(
-        &self,
-    ) -> (
-        (R1CSInstance<PallasPoint>, R1CSWitness<PallasPoint>),
-        (R1CSShape<MainGroup>, R1CSGens<MainGroup>),
-    ) {
-        let result_i = self.result.i.clone().into();
-        let result_x = self.result.x.clone().into();
-        let result_y = self.result.y.clone().into();
-        let Self { t, .. } = *self;
+impl RawVanillaProof<PallasScalar> {
+    pub fn make_nova_r1cs(
+        self,
+        shape: &R1CSShape<PallasGroup>,
+        gens: &R1CSGens<PallasGroup>,
+    ) -> Result<(R1CSInstance<PallasPoint>, R1CSWitness<PallasPoint>), NovaError> {
+        let mut cs = ProvingAssignment::<PallasGroup>::new();
 
-        let one = PrimeField::one();
-        let zero: PallasScalar = PrimeField::zero();
-        let neg_one = zero - one;
+        self.synthesize(&mut cs).unwrap();
 
-        let mut num_cons = 0;
-        let num_vars = 5 * t as usize;
-        let num_inputs = 6;
+        let (instance, witness) = cs.r1cs_instance_and_witness(shape, gens)?;
 
-        // For legibility: z[num_vars] = one.
-        let one_index = num_vars;
+        Ok((instance, witness))
+    }
 
-        let mut witness: Vec<PallasScalar> = Vec::new();
-        let mut inputs: Vec<PallasScalar> = Vec::new();
+    pub fn make_nova_shape_and_gens(&self) -> (R1CSShape<PallasGroup>, R1CSGens<PallasGroup>) {
+        let mut cs = ShapeCS::<PallasGroup>::new();
+        self.clone().synthesize(&mut cs).unwrap();
+        let shape = cs.r1cs_shape();
+        let gens = cs.r1cs_gens();
 
-        let mut A: Vec<(usize, usize, PallasScalar)> = Vec::new();
-        let mut B: Vec<(usize, usize, PallasScalar)> = Vec::new();
-        let mut C: Vec<(usize, usize, PallasScalar)> = Vec::new();
-
-        let mut X = (&mut A, &mut B, &mut C, &mut num_cons);
-
-        // One step:
-        // i_n+1 = i_n - 1
-        // x_n+1 = y_n - i_n + 1
-        // y_n+1 = x_n^5 - x_n+1
-
-        // I0 = i_0
-        // I1 = x_0
-        // I2 = y_0
-        // I3 = i_n
-        // I4 = x_n
-        // I5 = y_n
-
-        // Z0 = I0 - 1 = i_1
-        // Z1 = I2 - Z0 = x_1
-        // Z2 = Z1 * Z1
-        // Z3 = Z2 * Z2
-        // Z4 = (Z3 * Z1) - Z1 = y_1
-
-        // when n > 0, i_n = Zk: k = 0 + 5(n-1)
-        // when n > 0, x_n = Zk: k = 1 + 5(n-1)
-        // when n > 0, y_n = Zk: k = 4 + 5(n-1)
-
-        // R1CS
-
-        // Initial:
-        // (I0 - 1) * 1 - Z0 = 0
-        // (I2 - Z)) * 1 - Z1 = 0
-        // I1 * I1 - Z2 = 0
-        // Z2 * Z2 - Z3 = 0
-        // Z3 * Z1 - (Z4 + Z1) = 0
-
-        // Repeated:
-        // (Z0 - 1) * 1 - Z5 = 0
-        // (Z2 - Z0) * 1 - Z6 = 0
-        // Z1 * Z1 - Z7 = 0
-        // Z7 * Z7 - Z8 = 0
-        // Z8 * Z1 - (Z9 + Z6) = 0
-
-        // Repeat, t-1 times.
-
-        // Witness is:
-        // Z0 Z1 Z2 ... Zn-1 One I0 I1 I2 I3 I4
-        //
-        // Z0 = W[0]
-        // One = W[num_vars]
-        // I0 = W[num_vars + 1]
-
-        // let mut i_index = num_vars + 1; // I0
-        //                                 //    let mut x_index = num_vars + 2; // I1
-        // let mut y_index = num_vars + 3; // I2
-
-        // Add constraints and construct witness
-        let mut add_step_constraints = |i_index, x_index, y_index, w| {
-            add_constraint(
-                &mut X,
-                vec![(i_index, one), (one_index, neg_one)],
-                vec![(one_index, one)],
-                vec![(w, one)],
-            );
-
-            add_constraint(
-                &mut X,
-                vec![(y_index, one), (w, neg_one)],
-                vec![(one_index, one)],
-                vec![(w + 1, one)],
-            );
-
-            add_constraint(
-                &mut X,
-                vec![(x_index, one)],
-                vec![(x_index, one)],
-                vec![(w + 2, one)],
-            );
-
-            add_constraint(
-                &mut X,
-                vec![(w + 2, one)],
-                vec![(w + 2, one)],
-                vec![(w + 3, one)],
-            );
-
-            add_constraint(
-                &mut X,
-                vec![(w + 3, one)],
-                vec![(x_index, one)],
-                vec![(w + 4, one), (w + 1, one)],
-            );
-        };
-
-        let mut add_step_witnesses = |i: &PallasScalar, x: &PallasScalar, y: &PallasScalar| {
-            let new_i = *i - one;
-            witness.push(new_i);
-
-            let new_x = *y - new_i;
-            witness.push(new_x);
-
-            let mut new_y = *x * *x;
-            witness.push(new_y);
-
-            new_y *= new_y;
-            witness.push(new_y);
-
-            new_y *= x;
-            new_y = new_y.sub(&new_x);
-            witness.push(new_y);
-
-            (new_i, new_x, new_y)
-        };
-
-        {
-            let mut w = 0;
-            let mut i = result_i;
-            let mut x = result_x;
-            let mut y = result_y;
-
-            for j in 0..t {
-                let (i_index, x_index, y_index) = if w == 0 {
-                    (num_vars + 1, num_vars + 2, num_vars + 3)
-                } else {
-                    assert_eq!(0, w % 5);
-                    (w - 5, w - 4, w - 1)
-                };
-
-                add_step_constraints(i_index, x_index, y_index, w);
-
-                let (new_i, new_x, new_y) = add_step_witnesses(&i, &x, &y);
-
-                i = new_i;
-                x = new_x;
-                y = new_y;
-
-                w += 5;
-            }
-        }
-
-        let add_final_constraints = || {
-            // TODO: Add equality constraints or else optimize away the witness allocations.
-        };
-
-        let mut add_final_witnesses = || {
-            let w = witness.len();
-            inputs.push(result_i);
-            inputs.push(result_x);
-            inputs.push(result_y);
-            // FIXME: Add equality constraints or else optimize away the witness allocations.
-            inputs.push(witness[w - 5]);
-            inputs.push(witness[w - 4]);
-            inputs.push(witness[w - 1]);
-        };
-
-        add_final_constraints();
-        add_final_witnesses();
-
-        assert_eq!(witness.len(), num_vars);
-
-        let (S, gens) = make_nova_shape_and_gens(num_cons, num_vars, num_inputs, A, B, C);
-
-        let W = {
-            let res = R1CSWitness::new(&S, &witness);
-            assert!(res.is_ok());
-            res.unwrap()
-        };
-        let U = {
-            let comm_W = W.commit(&gens);
-            let res = R1CSInstance::new(&S, &comm_W, &inputs);
-            assert!(res.is_ok());
-            res.unwrap()
-        };
-        ((U, W), (S, gens))
+        (shape, gens)
     }
 }
 
@@ -251,25 +86,21 @@ impl<V: MinRootVDF<F>, F: FieldExt> From<VanillaVDFProof<V, F>> for RawVanillaPr
     fn from(v: VanillaVDFProof<V, F>) -> Self {
         RawVanillaProof {
             inverse_exponent: V::inverse_exponent(),
-            result: v.result,
+            result: Some(v.result),
             intermediates: v.intermediates,
             t: v.t,
         }
     }
 }
 
-fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
-    proofs: Vec<RawVanillaProof<S>>,
-) -> (
-    NovaVDFProof,
-    (
-        RelaxedR1CSInstance<MainGroup>,
-        RelaxedR1CSWitness<MainGroup>,
-    ),
-) {
+pub fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
+    proofs: &[RawVanillaProof<PallasScalar>],
+    shape: &R1CSShape<PallasGroup>,
+    gens: &R1CSGens<PallasGroup>,
+) -> (NovaVDFProof, RelaxedR1CSInstance<PallasGroup>) {
     let mut r1cs_instances = proofs
         .iter()
-        .map(|p| p.make_nova_r1cs())
+        .map(|p| p.clone().make_nova_r1cs(shape, gens).unwrap())
         .collect::<Vec<_>>();
 
     r1cs_instances.reverse();
@@ -278,29 +109,32 @@ fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
 
     let mut step_proofs = Vec::new();
     let mut prover_transcript = Transcript::new(b"MinRootPallas");
+    let mut verifier_transcript = Transcript::new(b"MinRootPallas");
 
-    let (S, gens) = &r1cs_instances[0].1;
     let initial_acc = (
-        RelaxedR1CSInstance::default(&gens, &S),
-        RelaxedR1CSWitness::default(&S),
+        RelaxedR1CSInstance::default(gens, shape),
+        RelaxedR1CSWitness::default(shape),
     );
 
     let (acc_U, acc_W) =
         r1cs_instances
             .iter()
             .skip(1)
-            .fold(initial_acc, |(acc_U, acc_W), ((next_U, next_W), _)| {
+            .fold(initial_acc, |(acc_U, acc_W), (next_U, next_W)| {
                 let (step_proof, (step_U, step_W)) = make_step_snark(
                     gens,
-                    S,
+                    shape,
                     &acc_U,
                     &acc_W,
                     next_U,
                     next_W,
                     &mut prover_transcript,
                 );
+                step_proof
+                    .verify(&acc_U, next_U, &mut verifier_transcript)
+                    .unwrap();
                 step_proofs.push(step_proof);
-                (step_U.clone(), step_W.clone())
+                (step_U, step_W)
             });
 
     let final_proof = make_final_snark(&acc_W);
@@ -310,21 +144,21 @@ fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
         final_instance: acc_U.clone(),
     };
 
-    assert!(proof.verify(gens, S, &acc_U));
+    assert!(proof.verify(gens, shape, &acc_U));
 
-    (proof, (acc_U, acc_W))
+    (proof, acc_U)
 }
 
 fn make_step_snark(
-    gens: &R1CSGens<MainGroup>,
-    S: &R1CSShape<MainGroup>,
-    r_U: &RelaxedR1CSInstance<MainGroup>,
-    r_W: &RelaxedR1CSWitness<MainGroup>,
-    U2: &R1CSInstance<MainGroup>,
-    W2: &R1CSWitness<MainGroup>,
+    gens: &R1CSGens<PallasGroup>,
+    S: &R1CSShape<PallasGroup>,
+    r_U: &RelaxedR1CSInstance<PallasGroup>,
+    r_W: &RelaxedR1CSWitness<PallasGroup>,
+    U2: &R1CSInstance<PallasGroup>,
+    W2: &R1CSWitness<PallasGroup>,
     prover_transcript: &mut merlin::Transcript,
 ) -> (
-    StepSNARK<MainGroup>,
+    StepSNARK<PallasGroup>,
     (
         RelaxedR1CSInstance<PallasPoint>,
         RelaxedR1CSWitness<PallasPoint>,
@@ -334,7 +168,7 @@ fn make_step_snark(
     res.expect("make_step_snark failed")
 }
 
-fn make_final_snark(W: &RelaxedR1CSWitness<PallasPoint>) -> FinalSNARK<MainGroup> {
+fn make_final_snark(W: &RelaxedR1CSWitness<PallasPoint>) -> FinalSNARK<PallasGroup> {
     // produce a final SNARK
     let res = FinalSNARK::prove(W);
     res.expect("make_final_snark failed")
@@ -343,12 +177,11 @@ fn make_final_snark(W: &RelaxedR1CSWitness<PallasPoint>) -> FinalSNARK<MainGroup
 impl NovaVDFProof {
     fn verify(
         &self,
-        gens: &R1CSGens<MainGroup>,
-        S: &R1CSShape<MainGroup>,
-        U: &RelaxedR1CSInstance<MainGroup>,
+        gens: &R1CSGens<PallasGroup>,
+        S: &R1CSShape<PallasGroup>,
+        U: &RelaxedR1CSInstance<PallasGroup>,
     ) -> bool {
         let res = self.final_proof.verify(gens, S, U);
-        res.clone().unwrap();
         res.is_ok()
     }
 }
@@ -361,18 +194,137 @@ fn make_nova_shape_and_gens(
     A: Vec<(usize, usize, PallasScalar)>,
     B: Vec<(usize, usize, PallasScalar)>,
     C: Vec<(usize, usize, PallasScalar)>,
-) -> (R1CSShape<MainGroup>, R1CSGens<MainGroup>) {
+) -> (R1CSShape<PallasGroup>, R1CSGens<PallasGroup>) {
     // create a shape object
-    let S: R1CSShape<MainGroup> = {
+    let S: R1CSShape<PallasGroup> = {
         let res = R1CSShape::new(num_cons, num_vars, num_inputs, &A, &B, &C);
         assert!(res.is_ok());
         res.unwrap()
     };
 
     // generate generators
-    let gens: R1CSGens<MainGroup> = R1CSGens::new(num_cons, num_vars);
+    let gens: R1CSGens<PallasGroup> = R1CSGens::new(num_cons, num_vars);
 
     (S, gens)
+}
+
+impl Circuit<PallasScalar> for RawVanillaProof<PallasScalar> {
+    fn synthesize<CS>(self, cs: &mut CS) -> Result<(), SynthesisError>
+    where
+        CS: ConstraintSystem<PallasScalar>,
+    {
+        let (result_i, result_x, result_y) = if let Some(result) = self.result {
+            (Some(result.i), Some(result.x), Some(result.y))
+        } else {
+            (None, None, None)
+            //panic!("Cannot generate R1CSWitness or R1CSInstance without result values.");
+        };
+
+        let Self { t, .. } = self;
+
+        let mut i =
+            AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "result_i"), || {
+                result_i.ok_or(SynthesisError::AssignmentMissing)
+            })?;
+        let mut x =
+            AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "result_x"), || {
+                result_x.ok_or(SynthesisError::AssignmentMissing)
+            })?;
+        let mut y =
+            AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "result_y"), || {
+                result_y.ok_or(SynthesisError::AssignmentMissing)
+            })?;
+
+        for j in 0..t {
+            let (new_i, new_x, new_y) = inverse_round(
+                &mut cs.namespace(|| format!("inverse_round_{}", j)),
+                i,
+                x,
+                y,
+                j == t - 1,
+            )?;
+            i = new_i;
+            x = new_x;
+            y = new_y;
+        }
+
+        Ok(())
+    }
+}
+
+fn inverse_round<CS: ConstraintSystem<PallasScalar>>(
+    cs: &mut CS,
+    i: AllocatedNum<PallasScalar>,
+    x: AllocatedNum<PallasScalar>,
+    y: AllocatedNum<PallasScalar>,
+    last_round: bool,
+) -> Result<
+    (
+        AllocatedNum<PallasScalar>,
+        AllocatedNum<PallasScalar>,
+        AllocatedNum<PallasScalar>,
+    ),
+    SynthesisError,
+> {
+    // i = i - 1
+    let new_i = AllocatedNum::<PallasScalar>::alloc_maybe_input(
+        &mut cs.namespace(|| "new_i"),
+        last_round,
+        || {
+            if let Some(i) = i.get_value() {
+                Ok(i - PallasScalar::one())
+            } else {
+                Err(SynthesisError::AssignmentMissing)
+            }
+        },
+    )?;
+    cs.enforce(
+        || "new_i = i - 1",
+        |lc| lc + i.get_variable() - CS::one(),
+        |lc| lc + CS::one(),
+        |lc| lc + new_i.get_variable(),
+    );
+
+    let new_x = AllocatedNum::<PallasScalar>::alloc_maybe_input(
+        &mut cs.namespace(|| "new_x"),
+        last_round,
+        || {
+            if let (Some(y), Some(new_i)) = (y.get_value(), new_i.get_value()) {
+                Ok(y - new_i)
+            } else {
+                Err(SynthesisError::AssignmentMissing)
+            }
+        },
+    )?;
+    cs.enforce(
+        || "new_x = y - new_i",
+        |lc| lc + y.get_variable() - new_i.get_variable(),
+        |lc| lc + CS::one(),
+        |lc| lc + new_x.get_variable(),
+    );
+    let tmp1 = x.square(&mut cs.namespace(|| "tmp1"))?;
+    let tmp2 = tmp1.square(&mut cs.namespace(|| "tmp2"))?;
+    let new_y = AllocatedNum::<PallasScalar>::alloc_maybe_input(
+        &mut cs.namespace(|| "new_y"),
+        last_round,
+        || {
+            if let (Some(x), Some(new_x), Some(tmp2)) =
+                (x.get_value(), new_x.get_value(), tmp2.get_value())
+            {
+                Ok((tmp2 * x) - new_x)
+            } else {
+                Err(SynthesisError::AssignmentMissing)
+            }
+        },
+    )?;
+    cs.enforce(
+        || "new_y + new_x = (tmp2 * x)",
+        |lc| lc + tmp2.get_variable(),
+        |lc| lc + x.get_variable(),
+        |lc| lc + new_y.get_variable() + new_x.get_variable(),
+    );
+
+    Ok((new_i, new_x, new_y))
 }
 
 fn add_constraint<S: PrimeField>(
@@ -632,14 +584,15 @@ mod test {
 
         let raw_vanilla_proofs: Vec<RawVanillaProof<pallas::Scalar>> = all_vanilla_proofs
             .iter()
-            .map(|p| RawVanillaProof::<pallas::Scalar> {
-                inverse_exponent: V::inverse_exponent(),
-                result: p.result,
-                intermediates: p.intermediates.clone(),
-                t: p.t,
-            })
+            .map(|p| (p.clone()).into())
             .collect();
 
-        let _nova_proof = make_nova_proof(raw_vanilla_proofs);
+        let (S, gens) = RawVanillaProof::<PallasScalar>::new_empty(raw_vanilla_proofs[0].t)
+            .make_nova_shape_and_gens();
+
+        // This will panic if proof does not verify.
+        // Actual complete verification is still awkward without recursion,
+        // since we would need a verifier transcript supplied by the prover.
+        let (_nova_proof, _acc_U) = make_nova_proof::<PallasScalar>(&raw_vanilla_proofs, &S, &gens);
     }
 }
