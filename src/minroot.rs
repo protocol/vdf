@@ -51,7 +51,11 @@ impl MinRootVDF<pallas::Scalar> for PallasVDF {
 
     // To bench with this on 3970x:
     // RUSTFLAG="-C target-cpu=native -g" taskset -c 0,40 cargo bench
-    fn eval(&mut self, x: State<pallas::Scalar>, t: u64) -> State<pallas::Scalar> {
+    fn eval(
+        &mut self,
+        x: State<pallas::Scalar>,
+        t: u64,
+    ) -> (State<pallas::Scalar>, Option<Vec<State<pallas::Scalar>>>) {
         match self.eval_mode {
             EvalMode::LTRSequential
             | EvalMode::LTRAddChainSequential
@@ -90,14 +94,18 @@ impl PallasVDF {
 
     // To bench with this on 3970x:
     // RUSTFLAG="-C target-cpu=native -g" taskset -c 0,40 cargo bench
-    fn eval_rtl(&mut self, x: State<pallas::Scalar>, t: u64) -> State<pallas::Scalar> {
+    fn eval_rtl(
+        &mut self,
+        x: State<pallas::Scalar>,
+        t: u64,
+    ) -> (State<pallas::Scalar>, Option<Vec<State<pallas::Scalar>>>) {
         let bit_count = Self::bit_count();
         let squares1 = Arc::new(UnsafeCell::new(vec![[0u64; 4]; 254].into_boxed_slice()));
         let sq = Sq(squares1);
         let ready = Arc::new(AtomicUsize::new(1)); // Importantly, not zero.
         let ready_clone = Arc::clone(&ready);
 
-        crossbeam::scope(|s| {
+        let result = crossbeam::scope(|s| {
             s.spawn(|_| {
                 let squares = unsafe {
                     transmute::<&mut [[u64; 4]], &mut [pallas::Scalar]>(slice::from_raw_parts_mut(
@@ -130,7 +138,9 @@ impl PallasVDF {
             });
             (0..t).fold(x, |acc, _| self.round_with_squares(acc, &sq, &ready_clone))
         })
-        .unwrap()
+        .unwrap();
+
+        (result, None)
     }
 
     // To bench with this on 3970x:
@@ -139,14 +149,14 @@ impl PallasVDF {
         &mut self,
         x: State<pallas::Scalar>,
         t: u64,
-    ) -> State<pallas::Scalar> {
+    ) -> (State<pallas::Scalar>, Option<Vec<State<pallas::Scalar>>>) {
         let bit_count = Self::bit_count();
         let squares1 = Arc::new(UnsafeCell::new(vec![[0u64; 4]; 254].into_boxed_slice()));
         let sq = Sq(squares1);
         let ready = Arc::new(AtomicUsize::new(1)); // Importantly, not zero.
         let ready_clone = Arc::clone(&ready);
 
-        crossbeam::scope(|s| {
+        let result = crossbeam::scope(|s| {
             s.spawn(|_| {
                 let squares = unsafe {
                     transmute::<&mut [[u64; 4]], &mut [pallas::Scalar]>(slice::from_raw_parts_mut(
@@ -199,7 +209,9 @@ impl PallasVDF {
             });
             (0..t).fold(x, |acc, _| self.round_with_squares(acc, &sq, &ready_clone))
         })
-        .unwrap()
+        .unwrap();
+
+        (result, None)
     }
 
     /// one round in the slow/forward direction.
@@ -568,12 +580,22 @@ where
 
     /// Evaluate input `x` with time/difficulty parameter, `t` in the
     /// slow/forward direction.
-    fn eval(&mut self, x: State<F>, t: u64) -> State<F> {
+    fn eval(&mut self, x: State<F>, t: u64) -> (State<F>, Option<Vec<State<F>>>) {
         self.simple_eval(x, t)
     }
 
-    fn simple_eval(&mut self, x: State<F>, t: u64) -> State<F> {
-        (0..t).fold(x, |acc, _| self.round(acc))
+    fn simple_eval(&mut self, x: State<F>, t: u64) -> (State<F>, Option<Vec<State<F>>>) {
+        let mut intermediates = Some(Vec::with_capacity(t as usize));
+        let mut acc = x;
+        for i in 0..t {
+            if let Some(ref mut intermediates) = intermediates {
+                intermediates.push(acc)
+            };
+
+            acc = self.round(acc);
+        }
+
+        (acc, intermediates)
     }
 
     /// Invert evaluation of output `x` with time/difficulty parameter, `t` in
@@ -595,6 +617,7 @@ where
 pub struct VanillaVDFProof<V: MinRootVDF<F> + Debug, F: FieldExt> {
     pub result: State<F>,
     pub t: u64,
+    pub intermediates: Option<Vec<State<F>>>,
     _v: PhantomData<V>,
 }
 impl<V: MinRootVDF<F>, F: FieldExt> Clone for VanillaVDFProof<V, F> {
@@ -602,6 +625,7 @@ impl<V: MinRootVDF<F>, F: FieldExt> Clone for VanillaVDFProof<V, F> {
         Self {
             result: self.result.clone(),
             t: self.t,
+            intermediates: self.intermediates.clone(),
             _v: PhantomData::<V>::default(),
         }
     }
@@ -610,19 +634,22 @@ impl<V: MinRootVDF<F>, F: FieldExt> Clone for VanillaVDFProof<V, F> {
 impl<V: MinRootVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
     pub fn eval_and_prove(x: State<F>, t: u64) -> Self {
         let mut vdf = V::new();
-        let result = vdf.eval(x, t);
+        let (result, intermediates) = vdf.eval(x, t);
+
         Self {
             result,
             t,
+            intermediates,
             _v: PhantomData::<V>,
         }
     }
 
     pub fn eval_and_prove_with_mode(eval_mode: EvalMode, x: State<F>, t: u64) -> Self {
         let mut vdf = V::new_with_mode(eval_mode);
-        let result = vdf.eval(x, t);
+        let (result, intermediates) = vdf.eval(x, t);
         Self {
             result,
+            intermediates,
             t,
             _v: PhantomData::<V>,
         }
@@ -638,8 +665,16 @@ impl<V: MinRootVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
 
     pub fn append(&self, other: Self) -> Option<Self> {
         if other.verify(self.result) {
+            let intermediates = match (self.intermediates.clone(), other.intermediates) {
+                (Some(mut a), Some(b)) => {
+                    a.extend(b);
+                    Some(a)
+                }
+                _ => None,
+            };
             Some(Self {
                 result: other.result,
+                intermediates,
                 t: self.t + other.t,
                 _v: PhantomData::<V>,
             })
@@ -707,7 +742,7 @@ mod tests {
             let x = F::random(&mut rng);
             let y = F::random(&mut rng);
             let x = State { x, y, i: F::zero() };
-            let result = vdf.eval(x, t);
+            let (result, intermediates) = vdf.eval(x, t);
             let again = V::inverse_eval(result, t);
 
             assert_eq!(x, again);
@@ -727,15 +762,29 @@ mod tests {
         let x = F::random(&mut rng);
         let y = F::zero();
         let x = State { x, y, i: F::zero() };
-        let t = 12;
-        let n = 11;
+        let t = 4;
+        let n = 2;
 
         let first_proof = VanillaVDFProof::<V, F>::eval_and_prove(x, t);
 
         let final_proof = (1..n).fold(first_proof, |acc, _| {
             let new_proof = VanillaVDFProof::<V, F>::eval_and_prove(acc.result, t);
+
+            if let Some(intermediates) = &acc.intermediates {
+                let last = intermediates.last().unwrap();
+                let inverse = V::inverse_round(acc.result);
+                assert_eq!(&inverse, last);
+            }
+
             acc.append(new_proof).expect("failed to append proof")
         });
+
+        // Check that last intermediate is single-round inverse of final result.
+        if let Some(intermediates) = &final_proof.intermediates {
+            let last = intermediates.last().unwrap();
+            let inverse = V::inverse_round(final_proof.result);
+            assert_eq!(&inverse, last);
+        }
 
         assert_eq!(V::element(final_proof.t), final_proof.result.i);
         assert_eq!(n * t, final_proof.t);
