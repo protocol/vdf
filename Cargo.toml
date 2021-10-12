@@ -5,13 +5,12 @@ authors = ["porcuquine <porcuquine@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-#bellperson = "0.17.0"
-bellperson =  { git = "https://github.com/filecoin-project/bellperson", branch = "nova", features = ["nova"]}
+bellperson = "0.18.0"
 crossbeam = "0.8"
 
 ff = "0.11.0"
 merlin = "2.0.0"
-nova = { version = "0.3", package = "nova-snark" }
+nova = { git = "https://github.com/porcuquine/nova", branch = "bellperson", package = "nova-snark" }
 pairing = "0.21"
 pasta_curves = "0.2.1"
 rand = "0.8"

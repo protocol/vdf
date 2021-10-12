@@ -1,17 +1,14 @@
 use std::fmt::Debug;
 
-use bellperson::{
-    gadgets::num::AllocatedNum,
-    nova::{
-        prover::ProvingAssignment,
-        r1cs::{NovaShape, NovaWitness},
-        shape_cs::ShapeCS,
-    },
-    Circuit, ConstraintSystem, SynthesisError,
-};
+use bellperson::{gadgets::num::AllocatedNum, Circuit, ConstraintSystem, SynthesisError};
 
 use merlin::Transcript;
 use nova::{
+    bellperson::{
+        r1cs::{NovaShape, NovaWitness},
+        shape_cs::ShapeCS,
+        solver::SatisfyingAssignment,
+    },
     errors::NovaError,
     r1cs::{
         R1CSGens, R1CSInstance, R1CSShape, R1CSWitness, RelaxedR1CSInstance, RelaxedR1CSWitness,
@@ -63,7 +60,7 @@ impl RawVanillaProof<PallasScalar> {
         shape: &R1CSShape<PallasGroup>,
         gens: &R1CSGens<PallasGroup>,
     ) -> Result<(R1CSInstance<PallasPoint>, R1CSWitness<PallasPoint>), NovaError> {
-        let mut cs = ProvingAssignment::<PallasGroup>::new();
+        let mut cs = SatisfyingAssignment::<PallasGroup>::new();
 
         self.synthesize(&mut cs).unwrap();
 
@@ -97,6 +94,7 @@ pub fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
     proofs: &[RawVanillaProof<PallasScalar>],
     shape: &R1CSShape<PallasGroup>,
     gens: &R1CSGens<PallasGroup>,
+    verify_steps: bool, // Sanity check for development, until we have recursion.
 ) -> (NovaVDFProof, RelaxedR1CSInstance<PallasGroup>) {
     let mut r1cs_instances = proofs
         .iter()
@@ -104,6 +102,7 @@ pub fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
         .collect::<Vec<_>>();
 
     r1cs_instances.reverse();
+
     // TODO: Handle other cases.
     assert!(r1cs_instances.len() > 1);
 
@@ -130,10 +129,12 @@ pub fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
                     next_W,
                     &mut prover_transcript,
                 );
-                step_proof
-                    .verify(&acc_U, next_U, &mut verifier_transcript)
-                    .unwrap();
-                step_proofs.push(step_proof);
+                if verify_steps {
+                    step_proof
+                        .verify(&acc_U, next_U, &mut verifier_transcript)
+                        .unwrap();
+                    step_proofs.push(step_proof);
+                };
                 (step_U, step_W)
             });
 
@@ -143,8 +144,6 @@ pub fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
         final_proof,
         final_instance: acc_U.clone(),
     };
-
-    assert!(proof.verify(gens, shape, &acc_U));
 
     (proof, acc_U)
 }
@@ -184,28 +183,6 @@ impl NovaVDFProof {
         let res = self.final_proof.verify(gens, S, U);
         res.is_ok()
     }
-}
-
-// TODO: Use this to only generate shape and gens once.
-fn make_nova_shape_and_gens(
-    num_cons: usize,
-    num_vars: usize,
-    num_inputs: usize,
-    A: Vec<(usize, usize, PallasScalar)>,
-    B: Vec<(usize, usize, PallasScalar)>,
-    C: Vec<(usize, usize, PallasScalar)>,
-) -> (R1CSShape<PallasGroup>, R1CSGens<PallasGroup>) {
-    // create a shape object
-    let S: R1CSShape<PallasGroup> = {
-        let res = R1CSShape::new(num_cons, num_vars, num_inputs, &A, &B, &C);
-        assert!(res.is_ok());
-        res.unwrap()
-    };
-
-    // generate generators
-    let gens: R1CSGens<PallasGroup> = R1CSGens::new(num_cons, num_vars);
-
-    (S, gens)
 }
 
 impl Circuit<PallasScalar> for RawVanillaProof<PallasScalar> {
@@ -587,12 +564,15 @@ mod test {
             .map(|p| (p.clone()).into())
             .collect();
 
-        let (S, gens) = RawVanillaProof::<PallasScalar>::new_empty(raw_vanilla_proofs[0].t)
+        let (shape, gens) = RawVanillaProof::<PallasScalar>::new_empty(raw_vanilla_proofs[0].t)
             .make_nova_shape_and_gens();
 
         // This will panic if proof does not verify.
         // Actual complete verification is still awkward without recursion,
         // since we would need a verifier transcript supplied by the prover.
-        let (_nova_proof, _acc_U) = make_nova_proof::<PallasScalar>(&raw_vanilla_proofs, &S, &gens);
+        let (nova_proof, acc_U) =
+            make_nova_proof::<PallasScalar>(&raw_vanilla_proofs, &shape, &gens, true);
+
+        assert!(nova_proof.verify(&gens, &shape, &acc_U));
     }
 }
