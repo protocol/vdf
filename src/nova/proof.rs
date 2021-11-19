@@ -1,6 +1,9 @@
 use std::fmt::Debug;
 
-use bellperson::{gadgets::num::AllocatedNum, Circuit, ConstraintSystem, SynthesisError};
+use bellperson::{
+    gadgets::boolean::Boolean, gadgets::num::AllocatedNum, gadgets::num::Num, Circuit,
+    ConstraintSystem, LinearCombination, SynthesisError,
+};
 
 use merlin::Transcript;
 use nova::{
@@ -199,7 +202,7 @@ impl Circuit<PallasScalar> for RawVanillaProof<PallasScalar> {
 
         let Self { t, .. } = self;
 
-        let mut i =
+        let allocated_i =
             AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "result_i"), || {
                 result_i.ok_or(SynthesisError::AssignmentMissing)
             })?;
@@ -211,6 +214,8 @@ impl Circuit<PallasScalar> for RawVanillaProof<PallasScalar> {
             AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "result_y"), || {
                 result_y.ok_or(SynthesisError::AssignmentMissing)
             })?;
+
+        let mut i = Num::from(allocated_i);
 
         for j in 0..t {
             let (new_i, new_x, new_y) = inverse_round(
@@ -231,37 +236,30 @@ impl Circuit<PallasScalar> for RawVanillaProof<PallasScalar> {
 
 fn inverse_round<CS: ConstraintSystem<PallasScalar>>(
     cs: &mut CS,
-    i: AllocatedNum<PallasScalar>,
+    i: Num<PallasScalar>,
     x: AllocatedNum<PallasScalar>,
     y: AllocatedNum<PallasScalar>,
     last_round: bool,
 ) -> Result<
     (
-        AllocatedNum<PallasScalar>,
+        Num<PallasScalar>,
         AllocatedNum<PallasScalar>,
         AllocatedNum<PallasScalar>,
     ),
     SynthesisError,
 > {
     // i = i - 1
-    let new_i = AllocatedNum::<PallasScalar>::alloc_maybe_input(
-        &mut cs.namespace(|| "new_i"),
-        last_round,
-        || {
-            if let Some(i) = i.get_value() {
-                Ok(i - PallasScalar::one())
-            } else {
-                Err(SynthesisError::AssignmentMissing)
-            }
-        },
-    )?;
-    cs.enforce(
-        || "new_i = i - 1",
-        |lc| lc + i.get_variable() - CS::one(),
-        |lc| lc + CS::one(),
-        |lc| lc + new_i.get_variable(),
-    );
+    let new_i =
+        i.clone()
+            .add_bool_with_coeff(CS::one(), &Boolean::Constant(true), -PallasScalar::from(1));
 
+    if last_round {
+        AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "initial_i"), || {
+            new_i.get_value().ok_or(SynthesisError::AssignmentMissing)
+        })?;
+    }
+
+    // new_x = y - new_i = y - i + 1
     let new_x = AllocatedNum::<PallasScalar>::alloc_maybe_input(
         &mut cs.namespace(|| "new_x"),
         last_round,
@@ -273,14 +271,13 @@ fn inverse_round<CS: ConstraintSystem<PallasScalar>>(
             }
         },
     )?;
-    cs.enforce(
-        || "new_x = y - new_i",
-        |lc| lc + y.get_variable() - new_i.get_variable(),
-        |lc| lc + CS::one(),
-        |lc| lc + new_x.get_variable(),
-    );
+
+    // tmp1 = x * x
     let tmp1 = x.square(&mut cs.namespace(|| "tmp1"))?;
+    // tmp2 = tmp1 * tmp1
     let tmp2 = tmp1.square(&mut cs.namespace(|| "tmp2"))?;
+
+    // new_y = (tmp2 * x) - new_x
     let new_y = AllocatedNum::<PallasScalar>::alloc_maybe_input(
         &mut cs.namespace(|| "new_y"),
         last_round,
@@ -294,11 +291,18 @@ fn inverse_round<CS: ConstraintSystem<PallasScalar>>(
             }
         },
     )?;
+
+    // new_y = (tmp2 * x) - new_x
+    // (tmp2 * x) = new_y + new_x
+    // (tmp2 * x) = new_y + y - i + 1
     cs.enforce(
         || "new_y + new_x = (tmp2 * x)",
         |lc| lc + tmp2.get_variable(),
         |lc| lc + x.get_variable(),
-        |lc| lc + new_y.get_variable() + new_x.get_variable(),
+        |lc| {
+            lc + new_y.get_variable() + y.get_variable() - &i.lc(1.into())
+                + &LinearCombination::from_coeff(CS::one(), 1.into())
+        },
     );
 
     Ok((new_i, new_x, new_y))
