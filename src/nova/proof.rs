@@ -121,7 +121,6 @@ pub fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
     let (acc_U, acc_W) =
         r1cs_instances
             .iter()
-            .skip(1)
             .fold(initial_acc, |(acc_U, acc_W), (next_U, next_W)| {
                 let (step_proof, (step_U, step_W)) = make_step_snark(
                     gens,
