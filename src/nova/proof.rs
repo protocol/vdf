@@ -532,7 +532,7 @@ mod test {
     }
 
     fn test_nova_proof_aux<V: MinRootVDF<pallas::Scalar>>() {
-        use pasta_curves::arithmetic::Field;
+        use ff::Field;
 
         let mut rng = XorShiftRng::from_seed(TEST_SEED);
 

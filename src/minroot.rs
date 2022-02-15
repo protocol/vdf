@@ -70,6 +70,21 @@ impl MinRootVDF<pallas::Scalar> for PallasVDF {
         pallas::Scalar::from(n)
     }
 
+    #[inline]
+    fn exponent() -> [u64; 4] {
+        [
+            0xd69f2280cccccccd,
+            0x4e9ee0c9a143ba4a,
+            0x3333333333333333,
+            0x3333333333333333,
+        ]
+    }
+
+    #[inline]
+    fn inverse_exponent() -> u64 {
+        5
+    }
+
     /// Pallas' inverse_exponent is 5, so we can hardcode this.
     fn inverse_step(x: pallas::Scalar) -> pallas::Scalar {
         x.mul(&x.square().square())
@@ -458,6 +473,22 @@ impl MinRootVDF<vesta::Scalar> for VestaVDF {
     fn element(n: u64) -> vesta::Scalar {
         vesta::Scalar::from(n)
     }
+
+    #[inline]
+    fn exponent() -> [u64; 4] {
+        [
+            0xe0f0f3f0cccccccd,
+            0x4e9ee0c9a10a60e2,
+            0x3333333333333333,
+            0x3333333333333333,
+        ]
+    }
+
+    #[inline]
+    fn inverse_exponent() -> u64 {
+        5
+    }
+
     /// Vesta's inverse_exponent is 5, so we can hardcode this.
     fn inverse_step(x: vesta::Scalar) -> vesta::Scalar {
         x.mul(&x.square().square())
@@ -530,17 +561,11 @@ where
         EvalMode::LTRSequential
     }
 
-    #[inline]
     /// Exponent used to take a root in the 'slow' direction.
-    fn exponent() -> [u64; 4] {
-        F::RESCUE_INVALPHA
-    }
+    fn exponent() -> [u64; 4];
 
-    #[inline]
     /// Exponent used in the 'fast' direction.
-    fn inverse_exponent() -> u64 {
-        F::RESCUE_ALPHA
-    }
+    fn inverse_exponent() -> u64;
 
     #[inline]
     /// The building block of a round in the slow, 'forward' direction.
