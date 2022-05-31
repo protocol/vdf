@@ -1,275 +1,176 @@
 use std::fmt::Debug;
 
 use bellperson::{
-    gadgets::boolean::Boolean, gadgets::num::AllocatedNum, gadgets::num::Num, Circuit,
+    gadgets::{
+        boolean::Boolean,
+        num::{AllocatedNum, Num},
+    },
     ConstraintSystem, LinearCombination, SynthesisError,
 };
 
-use merlin::Transcript;
+use ff::{Field, PrimeField};
+
 use nova::{
-    bellperson::{
-        r1cs::{NovaShape, NovaWitness},
-        shape_cs::ShapeCS,
-        solver::SatisfyingAssignment,
-    },
     errors::NovaError,
-    r1cs::{
-        R1CSGens, R1CSInstance, R1CSShape, R1CSWitness, RelaxedR1CSInstance, RelaxedR1CSWitness,
+    traits::{
+        circuit::{StepCircuit, TrivialTestCircuit},
+        Group,
     },
-    traits::PrimeField,
+    CompressedSNARK, RecursiveSNARK,
 };
 
-use pasta_curves::{arithmetic::FieldExt, pallas};
+use pasta_curves::{pallas, vesta};
 
 use crate::minroot::{MinRootVDF, State, VanillaVDFProof};
 
-use nova::{FinalSNARK, StepSNARK};
+type G1 = pallas::Point;
+type G2 = vesta::Point;
 
-pub type PallasPoint = pallas::Point;
-pub type PallasScalar = pallas::Scalar;
+type S1 = pallas::Scalar;
+type S2 = vesta::Scalar;
 
-pub type PallasGroup = PallasPoint;
+type SS1 = nova::spartan_with_ipa_pc::RelaxedR1CSSNARK<G1>;
+type SS2 = nova::spartan_with_ipa_pc::RelaxedR1CSSNARK<G2>;
 
-pub struct NovaVDFProof {
-    final_proof: FinalSNARK<PallasGroup>,
-    final_instance: RelaxedR1CSInstance<PallasGroup>,
+type C1 = InverseMinRootCircuit<G1>;
+type C2 = TrivialTestCircuit<<G2 as Group>::Scalar>;
+
+type NovaVDFPublicParams = nova::PublicParams<
+    G1,
+    G2,
+    InverseMinRootCircuit<G1>,
+    TrivialTestCircuit<<G2 as Group>::Scalar>,
+>;
+
+#[derive(Debug)]
+pub enum Error {
+    Nova(NovaError),
+    Synthesis(SynthesisError),
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct RawVanillaProof<S>
+#[allow(clippy::large_enum_variant)]
+pub enum NovaVDFProof {
+    Recursive(RecursiveSNARK<G1, G2, C1, C2>),
+    Compressed(CompressedSNARK<G1, G2, C1, C2, SS1, SS2>),
+}
+
+#[derive(Clone, Debug)]
+pub struct InverseMinRootCircuit<G>
 where
-    S: Debug,
+    G: Debug + Group,
 {
     pub inverse_exponent: u64,
-    pub result: Option<State<S>>,
-    pub intermediates: Option<Vec<State<S>>>,
+    pub result: Option<State<G::Scalar>>,
+    pub input: Option<State<G::Scalar>>,
     pub t: u64,
 }
 
-impl<S: Debug + Default> RawVanillaProof<S> {
-    pub fn new_empty(t: u64) -> Self {
-        Self {
-            inverse_exponent: 5,
-            result: None,
-            intermediates: None,
-            t,
-        }
-    }
-}
-
-impl RawVanillaProof<PallasScalar> {
-    pub fn make_nova_r1cs(
-        self,
-        shape: &R1CSShape<PallasGroup>,
-        gens: &R1CSGens<PallasGroup>,
-    ) -> Result<(R1CSInstance<PallasPoint>, R1CSWitness<PallasPoint>), NovaError> {
-        let mut cs = SatisfyingAssignment::<PallasGroup>::new();
-
-        self.synthesize(&mut cs).unwrap();
-
-        let (instance, witness) = cs.r1cs_instance_and_witness(shape, gens)?;
-
-        Ok((instance, witness))
-    }
-
-    pub fn make_nova_shape_and_gens(&self) -> (R1CSShape<PallasGroup>, R1CSGens<PallasGroup>) {
-        let mut cs = ShapeCS::<PallasGroup>::new();
-        self.clone().synthesize(&mut cs).unwrap();
-        let shape = cs.r1cs_shape();
-        let gens = cs.r1cs_gens();
-
-        (shape, gens)
-    }
-}
-
-impl<V: MinRootVDF<F>, F: FieldExt> From<VanillaVDFProof<V, F>> for RawVanillaProof<F> {
-    fn from(v: VanillaVDFProof<V, F>) -> Self {
-        RawVanillaProof {
+impl<G: Group> InverseMinRootCircuit<G> {
+    fn new<V: MinRootVDF<G>>(v: &VanillaVDFProof<V, G>, previous_state: State<G::Scalar>) -> Self {
+        InverseMinRootCircuit {
             inverse_exponent: V::inverse_exponent(),
             result: Some(v.result),
-            intermediates: v.intermediates,
+            input: Some(previous_state),
             t: v.t,
         }
     }
 }
 
-pub fn make_nova_proof<S: Into<PallasScalar> + Copy + Clone + std::fmt::Debug>(
-    proofs: &[RawVanillaProof<PallasScalar>],
-    shape: &R1CSShape<PallasGroup>,
-    gens: &R1CSGens<PallasGroup>,
-    verify_steps: bool, // Sanity check for development, until we have recursion.
-) -> (NovaVDFProof, RelaxedR1CSInstance<PallasGroup>) {
-    let mut r1cs_instances = proofs
-        .iter()
-        .map(|p| p.clone().make_nova_r1cs(shape, gens).unwrap())
-        .collect::<Vec<_>>();
-
-    r1cs_instances.reverse();
-
-    // TODO: Handle other cases.
-    assert!(r1cs_instances.len() > 1);
-
-    let mut step_proofs = Vec::new();
-    let mut prover_transcript = Transcript::new(b"MinRootPallas");
-    let mut verifier_transcript = Transcript::new(b"MinRootPallas");
-
-    let initial_acc = (
-        RelaxedR1CSInstance::default(gens, shape),
-        RelaxedR1CSWitness::default(shape),
-    );
-
-    let (acc_U, acc_W) =
-        r1cs_instances
-            .iter()
-            .fold(initial_acc, |(acc_U, acc_W), (next_U, next_W)| {
-                let (step_proof, (step_U, step_W)) = make_step_snark(
-                    gens,
-                    shape,
-                    &acc_U,
-                    &acc_W,
-                    next_U,
-                    next_W,
-                    &mut prover_transcript,
-                );
-                if verify_steps {
-                    step_proof
-                        .verify(&acc_U, next_U, &mut verifier_transcript)
-                        .unwrap();
-                    step_proofs.push(step_proof);
-                };
-                (step_U, step_W)
-            });
-
-    let final_proof = make_final_snark(&acc_W);
-
-    let proof = NovaVDFProof {
-        final_proof,
-        final_instance: acc_U.clone(),
-    };
-
-    (proof, acc_U)
-}
-
-fn make_step_snark(
-    gens: &R1CSGens<PallasGroup>,
-    S: &R1CSShape<PallasGroup>,
-    r_U: &RelaxedR1CSInstance<PallasGroup>,
-    r_W: &RelaxedR1CSWitness<PallasGroup>,
-    U2: &R1CSInstance<PallasGroup>,
-    W2: &R1CSWitness<PallasGroup>,
-    prover_transcript: &mut merlin::Transcript,
-) -> (
-    StepSNARK<PallasGroup>,
-    (
-        RelaxedR1CSInstance<PallasPoint>,
-        RelaxedR1CSWitness<PallasPoint>,
-    ),
-) {
-    let res = StepSNARK::prove(gens, S, r_U, r_W, U2, W2, prover_transcript);
-    res.expect("make_step_snark failed")
-}
-
-fn make_final_snark(W: &RelaxedR1CSWitness<PallasPoint>) -> FinalSNARK<PallasGroup> {
-    // produce a final SNARK
-    let res = FinalSNARK::prove(W);
-    res.expect("make_final_snark failed")
-}
-
-impl NovaVDFProof {
-    fn verify(
-        &self,
-        gens: &R1CSGens<PallasGroup>,
-        S: &R1CSShape<PallasGroup>,
-        U: &RelaxedR1CSInstance<PallasGroup>,
-    ) -> bool {
-        let res = self.final_proof.verify(gens, S, U);
-        res.is_ok()
+impl<G> StepCircuit<G::Scalar> for InverseMinRootCircuit<G>
+where
+    G: Group,
+{
+    fn arity(&self) -> usize {
+        3
     }
-}
 
-impl Circuit<PallasScalar> for RawVanillaProof<PallasScalar> {
-    fn synthesize<CS>(self, cs: &mut CS) -> Result<(), SynthesisError>
+    fn synthesize<CS>(
+        &self,
+        cs: &mut CS,
+        z: &[AllocatedNum<G::Scalar>],
+    ) -> Result<Vec<AllocatedNum<G::Scalar>>, SynthesisError>
     where
-        CS: ConstraintSystem<PallasScalar>,
+        CS: ConstraintSystem<G::Scalar>,
     {
-        let (result_i, result_x, result_y) = if let Some(result) = self.result {
-            (Some(result.i), Some(result.x), Some(result.y))
-        } else {
-            (None, None, None)
-            //panic!("Cannot generate R1CSWitness or R1CSInstance without result values.");
-        };
+        assert_eq!(self.arity(), z.len());
 
-        let Self { t, .. } = self;
+        let t = self.t;
+        let mut x = z[0].clone();
+        let mut y = z[1].clone();
+        let i = z[2].clone();
+        let mut i_num = Num::from(i);
 
-        let allocated_i =
-            AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "result_i"), || {
-                result_i.ok_or(SynthesisError::AssignmentMissing)
-            })?;
-        let mut x =
-            AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "result_x"), || {
-                result_x.ok_or(SynthesisError::AssignmentMissing)
-            })?;
-        let mut y =
-            AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "result_y"), || {
-                result_y.ok_or(SynthesisError::AssignmentMissing)
-            })?;
-
-        let mut i = Num::from(allocated_i);
+        let mut final_x = x.clone();
+        let mut final_y = y.clone();
+        let mut final_i_num = i_num.clone();
 
         for j in 0..t {
             let (new_i, new_x, new_y) = inverse_round(
                 &mut cs.namespace(|| format!("inverse_round_{}", j)),
-                i,
+                i_num,
                 x,
                 y,
-                j == t - 1,
             )?;
-            i = new_i;
+            final_x = new_x.clone();
+            final_y = new_y.clone();
+            final_i_num = new_i.clone();
+            i_num = new_i;
             x = new_x;
             y = new_y;
         }
 
-        Ok(())
+        let final_i = AllocatedNum::<G::Scalar>::alloc(&mut cs.namespace(|| "final_i"), || {
+            final_i_num
+                .get_value()
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+
+        cs.enforce(
+            || "final_i matches final_i_num",
+            |lc| lc + final_i.get_variable(),
+            |lc| lc + CS::one(),
+            |_| final_i_num.lc(G::Scalar::one()),
+        );
+
+        let res = vec![final_x, final_y, final_i];
+
+        assert_eq!(self.arity(), z.len());
+
+        Ok(res)
+    }
+
+    fn output(&self, z: &[G::Scalar]) -> Vec<G::Scalar> {
+        // sanity check
+        let result = self.result.expect("result missing");
+        let state = self.input.expect("state missing");
+
+        debug_assert_eq!(z[0], result.x);
+        debug_assert_eq!(z[1], result.y);
+        debug_assert_eq!(z[2], result.i);
+
+        vec![state.x, state.y, state.i]
     }
 }
 
-fn inverse_round<CS: ConstraintSystem<PallasScalar>>(
+fn inverse_round<CS: ConstraintSystem<F>, F: PrimeField>(
     cs: &mut CS,
-    i: Num<PallasScalar>,
-    x: AllocatedNum<PallasScalar>,
-    y: AllocatedNum<PallasScalar>,
-    last_round: bool,
-) -> Result<
-    (
-        Num<PallasScalar>,
-        AllocatedNum<PallasScalar>,
-        AllocatedNum<PallasScalar>,
-    ),
-    SynthesisError,
-> {
+    i: Num<F>,
+    x: AllocatedNum<F>,
+    y: AllocatedNum<F>,
+) -> Result<(Num<F>, AllocatedNum<F>, AllocatedNum<F>), SynthesisError> {
     // i = i - 1
-    let new_i =
-        i.clone()
-            .add_bool_with_coeff(CS::one(), &Boolean::Constant(true), -PallasScalar::from(1));
-
-    if last_round {
-        AllocatedNum::<PallasScalar>::alloc_input(&mut cs.namespace(|| "initial_i"), || {
-            new_i.get_value().ok_or(SynthesisError::AssignmentMissing)
-        })?;
-    }
+    let new_i = i
+        .clone()
+        .add_bool_with_coeff(CS::one(), &Boolean::Constant(true), -F::from(1));
 
     // new_x = y - new_i = y - i + 1
-    let new_x = AllocatedNum::<PallasScalar>::alloc_maybe_input(
-        &mut cs.namespace(|| "new_x"),
-        last_round,
-        || {
-            if let (Some(y), Some(new_i)) = (y.get_value(), new_i.get_value()) {
-                Ok(y - new_i)
-            } else {
-                Err(SynthesisError::AssignmentMissing)
-            }
-        },
-    )?;
+    let new_x = AllocatedNum::<F>::alloc(&mut cs.namespace(|| "new_x"), || {
+        if let (Some(y), Some(new_i)) = (y.get_value(), new_i.get_value()) {
+            Ok(y - new_i)
+        } else {
+            Err(SynthesisError::AssignmentMissing)
+        }
+    })?;
 
     // tmp1 = x * x
     let tmp1 = x.square(&mut cs.namespace(|| "tmp1"))?;
@@ -277,23 +178,44 @@ fn inverse_round<CS: ConstraintSystem<PallasScalar>>(
     let tmp2 = tmp1.square(&mut cs.namespace(|| "tmp2"))?;
 
     // new_y = (tmp2 * x) - new_x
-    let new_y = AllocatedNum::<PallasScalar>::alloc_maybe_input(
-        &mut cs.namespace(|| "new_y"),
-        last_round,
-        || {
-            if let (Some(x), Some(new_x), Some(tmp2)) =
-                (x.get_value(), new_x.get_value(), tmp2.get_value())
-            {
-                Ok((tmp2 * x) - new_x)
-            } else {
-                Err(SynthesisError::AssignmentMissing)
-            }
-        },
-    )?;
+    let new_y = AllocatedNum::<F>::alloc(&mut cs.namespace(|| "new_y"), || {
+        if let (Some(x), Some(new_x), Some(tmp2)) =
+            (x.get_value(), new_x.get_value(), tmp2.get_value())
+        {
+            Ok((tmp2 * x) - new_x)
+        } else {
+            Err(SynthesisError::AssignmentMissing)
+        }
+    })?;
 
     // new_y = (tmp2 * x) - new_x
     // (tmp2 * x) = new_y + new_x
     // (tmp2 * x) = new_y + y - i + 1
+    if tmp2.get_value().is_some() {
+        debug_assert_eq!(
+            tmp2.get_value().ok_or(SynthesisError::AssignmentMissing)?
+                * x.get_value().ok_or(SynthesisError::AssignmentMissing)?,
+            new_y.get_value().ok_or(SynthesisError::AssignmentMissing)?
+                + new_x.get_value().ok_or(SynthesisError::AssignmentMissing)?,
+        );
+
+        debug_assert_eq!(
+            new_x.get_value().ok_or(SynthesisError::AssignmentMissing)?,
+            y.get_value().ok_or(SynthesisError::AssignmentMissing)?
+                - i.get_value().ok_or(SynthesisError::AssignmentMissing)?
+                + F::one()
+        );
+
+        debug_assert_eq!(
+            tmp2.get_value().ok_or(SynthesisError::AssignmentMissing)?
+                * x.get_value().ok_or(SynthesisError::AssignmentMissing)?,
+            new_y.get_value().ok_or(SynthesisError::AssignmentMissing)?
+                + y.get_value().ok_or(SynthesisError::AssignmentMissing)?
+                - i.get_value().ok_or(SynthesisError::AssignmentMissing)?
+                + F::one()
+        );
+    }
+
     cs.enforce(
         || "new_y + new_x = (tmp2 * x)",
         |lc| lc + tmp2.get_variable(),
@@ -307,31 +229,152 @@ fn inverse_round<CS: ConstraintSystem<PallasScalar>>(
     Ok((new_i, new_x, new_y))
 }
 
-fn add_constraint<S: PrimeField>(
-    X: &mut (
-        &mut Vec<(usize, usize, S)>,
-        &mut Vec<(usize, usize, S)>,
-        &mut Vec<(usize, usize, S)>,
-        &mut usize,
-    ),
-    a_index_coeff_pairs: Vec<(usize, S)>,
-    b_index_coeff_pairs: Vec<(usize, S)>,
-    c_index_coeff_pairs: Vec<(usize, S)>,
-) {
-    let (A, B, C, nn) = X;
-    let n = **nn;
-    let one = S::one();
+impl<G: Group> InverseMinRootCircuit<G> {
+    pub fn circuits(
+        num_iters_per_step: u64,
+    ) -> (InverseMinRootCircuit<G>, TrivialTestCircuit<G::Base>) {
+        (
+            Self::circuit_primary(num_iters_per_step),
+            Self::circuit_secondary(),
+        )
+    }
 
-    for (index, coeff) in a_index_coeff_pairs {
-        A.push((n, index, one * coeff));
+    pub fn circuit_primary(num_iters_per_step: u64) -> InverseMinRootCircuit<G> {
+        InverseMinRootCircuit {
+            inverse_exponent: 5,
+            result: None,
+            input: None,
+            t: num_iters_per_step,
+        }
     }
-    for (index, coeff) in b_index_coeff_pairs {
-        B.push((n, index, one * coeff));
+
+    pub fn circuit_secondary() -> TrivialTestCircuit<G::Base> {
+        TrivialTestCircuit::default()
     }
-    for (index, coeff) in c_index_coeff_pairs {
-        C.push((n, index, one * coeff));
+
+    pub fn eval_and_make_circuits<V: MinRootVDF<G>>(
+        _v: V,
+        num_iters_per_step: u64,
+        num_steps: usize,
+        initial_state: State<G::Scalar>,
+    ) -> (Vec<G::Scalar>, Vec<InverseMinRootCircuit<G>>) {
+        assert!(num_steps > 0);
+
+        let (z0_primary, all_vanilla_proofs) = {
+            let mut all_vanilla_proofs = Vec::with_capacity(num_steps);
+            let mut state = initial_state;
+            let mut z0_primary_opt = None;
+            for _ in 0..num_steps {
+                let (z0, proof) =
+                    VanillaVDFProof::<V, G>::eval_and_prove(state, num_iters_per_step);
+                state = proof.result;
+                all_vanilla_proofs.push(proof);
+                z0_primary_opt = Some(z0);
+            }
+            let z0_primary = z0_primary_opt.unwrap();
+            (z0_primary, all_vanilla_proofs)
+        };
+
+        let circuits = {
+            let mut previous_state = initial_state;
+            let mut circuits = all_vanilla_proofs
+                .iter()
+                .map(|p| {
+                    let rvp = Self::new(p, previous_state);
+                    previous_state = rvp.result.unwrap();
+                    rvp
+                })
+                .collect::<Vec<_>>();
+            circuits.reverse();
+            circuits
+        };
+        (z0_primary, circuits)
     }
-    **nn += 1;
+}
+
+impl NovaVDFProof {
+    pub fn prove_recursively(
+        pp: &NovaVDFPublicParams,
+        circuits: &[InverseMinRootCircuit<G1>],
+        num_iters_per_step: u64,
+        z0_primary: Vec<S1>,
+        z0_secondary: Vec<S2>,
+    ) -> Result<Self, Error> {
+        let debug = false;
+        let (_circuit_primary, circuit_secondary) =
+            InverseMinRootCircuit::<G1>::circuits(num_iters_per_step);
+
+        // produce a recursive SNARK
+        let mut recursive_snark: Option<RecursiveSNARK<G1, G2, C1, C2>> = None;
+
+        for (i, circuit_primary) in circuits.iter().enumerate() {
+            if debug {
+                // For debugging purposes, synthesize the circuit and check that the constraint system is satisfied.
+                use bellperson::util_cs::test_cs::TestConstraintSystem;
+                let mut cs = TestConstraintSystem::<<G1 as Group>::Scalar>::new();
+
+                let r = circuit_primary.result.unwrap();
+
+                let zi_allocated = vec![
+                    AllocatedNum::alloc(cs.namespace(|| format!("z{}_1", i)), || Ok(r.x))
+                        .map_err(Error::Synthesis)?,
+                    AllocatedNum::alloc(cs.namespace(|| format!("z{}_2", i)), || Ok(r.y))
+                        .map_err(Error::Synthesis)?,
+                    AllocatedNum::alloc(cs.namespace(|| format!("z{}_0", i)), || Ok(r.i))
+                        .map_err(Error::Synthesis)?,
+                ];
+
+                circuit_primary
+                    .synthesize(&mut cs, zi_allocated.as_slice())
+                    .map_err(Error::Synthesis)?;
+
+                assert!(cs.is_satisfied());
+            }
+
+            let res = RecursiveSNARK::prove_step(
+                pp,
+                recursive_snark,
+                circuit_primary.clone(),
+                circuit_secondary.clone(),
+                z0_primary.clone(),
+                z0_secondary.clone(),
+            );
+            if res.is_err() {
+                dbg!(&res);
+            }
+            assert!(res.is_ok());
+            recursive_snark = Some(res.map_err(Error::Nova)?);
+        }
+
+        Ok(Self::Recursive(recursive_snark.unwrap()))
+    }
+
+    pub fn compress(self, pp: &NovaVDFPublicParams) -> Result<Self, Error> {
+        match &self {
+            Self::Recursive(recursive_snark) => Ok(Self::Compressed(
+                CompressedSNARK::<_, _, _, _, SS1, SS2>::prove(pp, recursive_snark)
+                    .map_err(Error::Nova)?,
+            )),
+            Self::Compressed(_) => Ok(self),
+        }
+    }
+
+    fn verify(
+        &self,
+        pp: &NovaVDFPublicParams,
+        num_steps: usize,
+        z0_primary: Vec<S1>,
+        z0_secondary: Vec<S2>,
+        zi_primary: &[S1],
+        zi_secondary: &[S2],
+    ) -> Result<bool, NovaError> {
+        let (zi_primary_verified, zi_secondary_verified) = match self {
+            Self::Recursive(p) => p.verify(pp, num_steps, z0_primary, z0_secondary),
+            Self::Compressed(p) => p.verify(pp, num_steps, z0_primary, z0_secondary),
+        }?;
+
+        Ok(zi_primary == zi_primary_verified && zi_secondary == zi_secondary_verified)
+    }
 }
 
 #[cfg(test)]
@@ -339,243 +382,82 @@ mod test {
     use super::*;
     use crate::minroot::{PallasVDF, State};
     use crate::TEST_SEED;
-    use merlin::Transcript;
-    use nova::traits::PrimeField;
 
-    use pasta_curves::pallas;
-    use rand::rngs::OsRng;
+    use nova::traits::Group;
     use rand::SeedableRng;
     use rand_xorshift::XorShiftRng;
 
-    type S = PallasScalar;
-    type G = PallasPoint;
-
-    #[test]
-    #[allow(non_snake_case)]
-    fn test_tiny_r1cs() {
-        let one = S::one();
-        let (num_cons, num_vars, num_inputs, A, B, C) = {
-            let mut num_cons = 0;
-            let num_vars = 4;
-            let num_inputs = 2;
-
-            // Consider a cubic equation: `x^3 + x + 5 = y`, where `x` and `y` are respectively the input and output.
-            // The R1CS for this problem consists of the following constraints:
-            // `I0 * I0 - Z0 = 0`
-            // `Z0 * I0 - Z1 = 0`
-            // `(Z1 + I0) * 1 - Z2 = 0`
-            // `(Z2 + 5) * 1 - I1 = 0`
-
-            // Relaxed R1CS is a set of three sparse matrices (A B C), where there is a row for every
-            // constraint and a column for every entry in z = (vars, u, inputs)
-            // An R1CS instance is satisfiable iff:
-            // Az \circ Bz = u \cdot Cz + E, where z = (vars, 1, inputs)
-            let mut A: Vec<(usize, usize, S)> = Vec::new();
-            let mut B: Vec<(usize, usize, S)> = Vec::new();
-            let mut C: Vec<(usize, usize, S)> = Vec::new();
-
-            // // The R1CS for this problem consists of the following constraints:
-            // // `Z0 * Z0 - Z1 = 0`
-            // // `Z1 * Z0 - Z2 = 0`
-            // // `(Z2 + Z0) * 1 - Z3 = 0`
-            // // `(Z3 + 5) * 1 - I0 = 0`
-
-            // // Relaxed R1CS is a set of three sparse matrices (A B C), where there is a row for every
-            // // constraint and a column for every entry in z = (vars, u, inputs)
-            // // An R1CS instance is satisfiable iff:
-            // // Az \circ Bz = u \cdot Cz + E, where z = (vars, 1, inputs)
-            // let mut A: Vec<(usize, usize, S)> = Vec::new();
-            // let mut B: Vec<(usize, usize, S)> = Vec::new();
-            // let mut C: Vec<(usize, usize, S)> = Vec::new();
-
-            let mut X = (&mut A, &mut B, &mut C, &mut num_cons);
-
-            // constraint 0 entries in (A,B,C)
-            // `I0 * I0 - Z0 = 0`
-            add_constraint(
-                &mut X,
-                vec![(num_vars + 1, one)],
-                vec![(num_vars + 1, one)],
-                vec![(0, one)],
-            );
-
-            // constraint 1 entries in (A,B,C)
-            // `Z0 * I0 - Z1 = 0`
-            add_constraint(
-                &mut X,
-                vec![(0, one)],
-                vec![(num_vars + 1, one)],
-                vec![(1, one)],
-            );
-
-            // constraint 2 entries in (A,B,C)
-            // `(Z1 + I0) * 1 - Z2 = 0`
-            add_constraint(
-                &mut X,
-                vec![(1, one), (num_vars + 1, one)],
-                vec![(num_vars, one)],
-                vec![(2, one)],
-            );
-
-            // constraint 3 entries in (A,B,C)
-            // `(Z2 + 5) * 1 - I1 = 0`
-            add_constraint(
-                &mut X,
-                vec![(2, one), (num_vars, one + one + one + one + one)],
-                vec![(num_vars, one)],
-                vec![(num_vars + 2, one)],
-            );
-
-            (num_cons, num_vars, num_inputs, A, B, C)
-        };
-
-        // create a shape object
-        let S = {
-            let res = R1CSShape::new(num_cons, num_vars, num_inputs, &A, &B, &C);
-            assert!(res.is_ok());
-            res.unwrap()
-        };
-
-        // generate generators
-        let gens = R1CSGens::new(num_cons, num_vars);
-
-        let rand_inst_witness_generator =
-            |gens: &R1CSGens<G>, I: &S| -> (S, R1CSInstance<G>, R1CSWitness<G>) {
-                let i0 = *I;
-
-                // compute a satisfying (vars, X) tuple
-                let (O, vars, X) = {
-                    let z0 = i0 * i0; // constraint 0
-                    let z1 = i0 * z0; // constraint 1
-                    let z2 = z1 + i0; // constraint 2
-                    let i1 = z2 + one + one + one + one + one; // constraint 3
-
-                    // store the witness and IO for the instance
-                    let W = vec![z0, z1, z2, S::zero()];
-                    let X = vec![i0, i1];
-                    (i1, W, X)
-                };
-
-                let W = {
-                    let res = R1CSWitness::new(&S, &vars);
-                    assert!(res.is_ok());
-                    res.unwrap()
-                };
-                let U = {
-                    let comm_W = W.commit(gens);
-                    let res = R1CSInstance::new(&S, &comm_W, &X);
-                    assert!(res.is_ok());
-                    res.unwrap()
-                };
-
-                // check that generated instance is satisfiable
-                assert!(S.is_sat(gens, &U, &W).is_ok());
-
-                (O, U, W)
-            };
-
-        let mut csprng: OsRng = OsRng;
-        let I = S::random(&mut csprng); // the first input is picked randomly for the first instance
-        let (O, U1, W1) = rand_inst_witness_generator(&gens, &I);
-        let (_O, U2, W2) = rand_inst_witness_generator(&gens, &O);
-
-        // produce a default running instance
-        let mut r_W = RelaxedR1CSWitness::default(&S);
-        let mut r_U = RelaxedR1CSInstance::default(&gens, &S);
-
-        // produce a step SNARK with (W1, U1) as the first incoming witness-instance pair
-        let mut prover_transcript = Transcript::new(b"StepSNARKExample");
-        let res = StepSNARK::prove(&gens, &S, &r_U, &r_W, &U1, &W1, &mut prover_transcript);
-        assert!(res.is_ok());
-        let (step_snark, (_U, W)) = res.unwrap();
-
-        // verify the step SNARK with U1 as the first incoming instance
-        let mut verifier_transcript = Transcript::new(b"StepSNARKExample");
-        let res = step_snark.verify(&r_U, &U1, &mut verifier_transcript);
-        assert!(res.is_ok());
-        let U = res.unwrap();
-
-        assert_eq!(U, _U);
-
-        // update the running witness and instance
-        r_W = W;
-        r_U = U;
-
-        // produce a step SNARK with (W2, U2) as the second incoming witness-instance pair
-        let res = StepSNARK::prove(&gens, &S, &r_U, &r_W, &U2, &W2, &mut prover_transcript);
-        assert!(res.is_ok());
-        let (step_snark, (_U, W)) = res.unwrap();
-
-        // verify the step SNARK with U1 as the first incoming instance
-        let res = step_snark.verify(&r_U, &U2, &mut verifier_transcript);
-        assert!(res.is_ok());
-        let U = res.unwrap();
-
-        assert_eq!(U, _U);
-
-        // update the running witness and instance
-        r_W = W;
-        r_U = U;
-
-        // produce a final SNARK
-        let res = FinalSNARK::prove(&r_W);
-        assert!(res.is_ok());
-        let final_snark = res.unwrap();
-        // verify the final SNARK
-        let res = final_snark.verify(&gens, &S, &r_U);
-        assert!(res.is_ok());
-    }
-
     #[test]
     fn test_nova_proof() {
-        test_nova_proof_aux::<PallasVDF>();
+        test_nova_proof_aux::<PallasVDF>(5, 3);
     }
 
-    fn test_nova_proof_aux<V: MinRootVDF<pallas::Scalar>>() {
-        use pasta_curves::arithmetic::Field;
-
+    fn test_nova_proof_aux<V: MinRootVDF<G1> + PartialEq>(
+        num_iters_per_step: u64,
+        num_steps: usize,
+    ) {
         let mut rng = XorShiftRng::from_seed(TEST_SEED);
 
-        type F = pallas::Scalar;
+        type F = S1;
+        type G = G1;
 
         let x = Field::random(&mut rng);
         let y = F::zero();
-        let x = State { x, y, i: F::zero() };
-        let t = 4;
-        let n = 3;
+        let initial_i = F::one();
 
-        let first_vanilla_proof = VanillaVDFProof::<V, F>::eval_and_prove(x, t);
+        let initial_state = State { x, y, i: initial_i };
+        let zi_primary = vec![x, y, initial_i];
 
-        let mut all_vanilla_proofs = Vec::with_capacity(12);
-        all_vanilla_proofs.push(first_vanilla_proof.clone());
+        let (circuit_primary, circuit_secondary) =
+            InverseMinRootCircuit::circuits(num_iters_per_step);
 
-        let final_vanilla_proof = (1..n).fold(first_vanilla_proof, |acc, _| {
-            let new_proof = VanillaVDFProof::<V, F>::eval_and_prove(acc.result, t);
-            all_vanilla_proofs.push(new_proof.clone());
-            acc.append(new_proof).expect("failed to append proof")
-        });
+        // produce public parameters
+        let pp = NovaVDFPublicParams::setup(circuit_primary, circuit_secondary.clone());
 
-        assert_eq!(
-            V::element(final_vanilla_proof.t),
-            final_vanilla_proof.result.i
+        let (z0_primary, circuits) = InverseMinRootCircuit::eval_and_make_circuits(
+            V::new(),
+            num_iters_per_step,
+            num_steps,
+            initial_state,
         );
-        assert_eq!(n * t, final_vanilla_proof.t);
-        assert!(final_vanilla_proof.verify(x));
 
-        let raw_vanilla_proofs: Vec<RawVanillaProof<pallas::Scalar>> = all_vanilla_proofs
-            .iter()
-            .map(|p| (p.clone()).into())
-            .collect();
+        let z0_secondary = vec![<G2 as Group>::Scalar::zero()];
 
-        let (shape, gens) = RawVanillaProof::<PallasScalar>::new_empty(raw_vanilla_proofs[0].t)
-            .make_nova_shape_and_gens();
+        let recursive_snark = NovaVDFProof::prove_recursively(
+            &pp,
+            &circuits,
+            num_iters_per_step,
+            z0_primary.clone(),
+            z0_secondary.clone(),
+        )
+        .unwrap();
 
-        // This will panic if proof does not verify.
-        // Actual complete verification is still awkward without recursion,
-        // since we would need a verifier transcript supplied by the prover.
-        let (nova_proof, acc_U) =
-            make_nova_proof::<PallasScalar>(&raw_vanilla_proofs, &shape, &gens, true);
+        // verify the recursive SNARK
+        let res = recursive_snark.verify(
+            &pp,
+            num_steps,
+            z0_primary.clone(),
+            z0_secondary.clone(),
+            &zi_primary,
+            &z0_secondary,
+        );
 
-        assert!(nova_proof.verify(&gens, &shape, &acc_U));
+        if !res.is_ok() {
+            dbg!(&res);
+        }
+        assert!(res.unwrap());
+
+        // produce a compressed SNARK
+        let compressed_snark = recursive_snark.compress(&pp).unwrap();
+        // verify the compressed SNARK
+        let res = compressed_snark.verify(
+            &pp,
+            num_steps,
+            z0_primary,
+            z0_secondary.clone(),
+            &zi_primary,
+            &z0_secondary,
+        );
+        assert!(res.is_ok());
     }
 }
