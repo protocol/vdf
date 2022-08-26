@@ -229,6 +229,13 @@ fn inverse_round<CS: ConstraintSystem<F>, F: PrimeField>(
     Ok((new_i, new_x, new_y))
 }
 
+pub fn public_params(num_iters_per_step: u64) -> NovaVDFPublicParams {
+    let (circuit_primary, circuit_secondary) =
+        InverseMinRootCircuit::<G1>::circuits(num_iters_per_step);
+
+    NovaVDFPublicParams::setup(circuit_primary, circuit_secondary.clone())
+}
+
 impl<G: Group> InverseMinRootCircuit<G> {
     pub fn circuits(
         num_iters_per_step: u64,
@@ -414,11 +421,8 @@ mod test {
         let initial_state = State { x, y, i: initial_i };
         let zi = vec![x, y, initial_i];
 
-        let (circuit_primary, circuit_secondary) =
-            InverseMinRootCircuit::circuits(num_iters_per_step);
-
         // produce public parameters
-        let pp = NovaVDFPublicParams::setup(circuit_primary, circuit_secondary.clone());
+        let pp = public_params(num_iters_per_step);
 
         let (z0, circuits) = InverseMinRootCircuit::eval_and_make_circuits(
             V::new(),
