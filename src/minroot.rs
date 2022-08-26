@@ -374,13 +374,13 @@ where
 }
 
 #[derive(Debug, PartialEq)]
-pub struct VanillaVDFProof<V: MinRootVDF<G> + Debug, G: Group> {
+pub struct Evaluation<V: MinRootVDF<G> + Debug, G: Group> {
     pub result: State<G::Scalar>,
     pub t: u64,
     _v: PhantomData<V>,
 }
 
-impl<V: MinRootVDF<G>, G: Group> Clone for VanillaVDFProof<V, G> {
+impl<V: MinRootVDF<G>, G: Group> Clone for Evaluation<V, G> {
     fn clone(&self) -> Self {
         Self {
             result: self.result,
@@ -390,8 +390,8 @@ impl<V: MinRootVDF<G>, G: Group> Clone for VanillaVDFProof<V, G> {
     }
 }
 
-impl<V: MinRootVDF<G>, G: Group> VanillaVDFProof<V, G> {
-    pub fn eval_and_prove(x: State<G::Scalar>, t: u64) -> (Vec<G::Scalar>, Self) {
+impl<V: MinRootVDF<G>, G: Group> Evaluation<V, G> {
+    pub fn eval(x: State<G::Scalar>, t: u64) -> (Vec<G::Scalar>, Self) {
         let mut vdf = V::new();
         let result = vdf.eval(x, t);
 
@@ -407,7 +407,7 @@ impl<V: MinRootVDF<G>, G: Group> VanillaVDFProof<V, G> {
         )
     }
 
-    pub fn eval_and_prove_with_mode(eval_mode: EvalMode, x: State<G::Scalar>, t: u64) -> Self {
+    pub fn eval_with_mode(eval_mode: EvalMode, x: State<G::Scalar>, t: u64) -> Self {
         let mut vdf = V::new_with_mode(eval_mode);
         let result = vdf.eval(x, t);
         Self {
@@ -528,10 +528,10 @@ mod tests {
         let t = 4;
         let n = 3;
 
-        let (_z0, first_proof) = VanillaVDFProof::<V, G>::eval_and_prove(x, t);
+        let (_z0, first_proof) = Evaluation::<V, G>::eval(x, t);
 
         let final_proof = (1..n).fold(first_proof, |acc, _| {
-            let (_, new_proof) = VanillaVDFProof::<V, G>::eval_and_prove(acc.result, t);
+            let (_, new_proof) = Evaluation::<V, G>::eval(acc.result, t);
 
             acc.append(new_proof).expect("failed to append proof")
         });

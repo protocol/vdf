@@ -21,7 +21,7 @@ use nova::{
 
 use pasta_curves::{pallas, vesta};
 
-use crate::minroot::{MinRootVDF, State, VanillaVDFProof};
+use crate::minroot::{Evaluation, MinRootVDF, State};
 
 type G1 = pallas::Point;
 type G2 = vesta::Point;
@@ -66,7 +66,7 @@ where
 }
 
 impl<G: Group> InverseMinRootCircuit<G> {
-    fn new<V: MinRootVDF<G>>(v: &VanillaVDFProof<V, G>, previous_state: State<G::Scalar>) -> Self {
+    fn new<V: MinRootVDF<G>>(v: &Evaluation<V, G>, previous_state: State<G::Scalar>) -> Self {
         InverseMinRootCircuit {
             inverse_exponent: V::inverse_exponent(),
             result: Some(v.result),
@@ -265,8 +265,7 @@ impl<G: Group> InverseMinRootCircuit<G> {
             let mut state = initial_state;
             let mut z0_primary_opt = None;
             for _ in 0..num_steps {
-                let (z0, proof) =
-                    VanillaVDFProof::<V, G>::eval_and_prove(state, num_iters_per_step);
+                let (z0, proof) = Evaluation::<V, G>::eval(state, num_iters_per_step);
                 state = proof.result;
                 all_vanilla_proofs.push(proof);
                 z0_primary_opt = Some(z0);
@@ -413,7 +412,7 @@ mod test {
         let initial_i = F::one();
 
         let initial_state = State { x, y, i: initial_i };
-        let zi_primary = vec![x, y, initial_i];
+        let zi = vec![x, y, initial_i];
 
         let (circuit_primary, circuit_secondary) =
             InverseMinRootCircuit::circuits(num_iters_per_step);
@@ -421,7 +420,7 @@ mod test {
         // produce public parameters
         let pp = NovaVDFPublicParams::setup(circuit_primary, circuit_secondary.clone());
 
-        let (z0_primary, circuits) = InverseMinRootCircuit::eval_and_make_circuits(
+        let (z0, circuits) = InverseMinRootCircuit::eval_and_make_circuits(
             V::new(),
             num_iters_per_step,
             num_steps,
@@ -429,11 +428,11 @@ mod test {
         );
 
         let recursive_snark =
-            NovaVDFProof::prove_recursively(&pp, &circuits, num_iters_per_step, z0_primary.clone())
+            NovaVDFProof::prove_recursively(&pp, &circuits, num_iters_per_step, z0.clone())
                 .unwrap();
 
         // verify the recursive SNARK
-        let res = recursive_snark.verify(&pp, num_steps, z0_primary.clone(), &zi_primary);
+        let res = recursive_snark.verify(&pp, num_steps, z0.clone(), &zi);
 
         if !res.is_ok() {
             dbg!(&res);
@@ -443,7 +442,7 @@ mod test {
         // produce a compressed SNARK
         let compressed_snark = recursive_snark.compress(&pp).unwrap();
         // verify the compressed SNARK
-        let res = compressed_snark.verify(&pp, num_steps, z0_primary, &zi_primary);
+        let res = compressed_snark.verify(&pp, num_steps, z0, &zi);
         assert!(res.is_ok());
     }
 }
