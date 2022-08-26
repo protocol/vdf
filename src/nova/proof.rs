@@ -297,10 +297,12 @@ impl NovaVDFProof {
         pp: &NovaVDFPublicParams,
         circuits: &[InverseMinRootCircuit<G1>],
         num_iters_per_step: u64,
-        z0_primary: Vec<S1>,
-        z0_secondary: Vec<S2>,
+        z0: Vec<S1>,
     ) -> Result<Self, Error> {
         let debug = false;
+        let z0_primary = z0;
+        let z0_secondary = Self::z0_secondary();
+
         let (_circuit_primary, circuit_secondary) =
             InverseMinRootCircuit::<G1>::circuits(num_iters_per_step);
 
@@ -359,21 +361,27 @@ impl NovaVDFProof {
         }
     }
 
-    fn verify(
+    pub fn verify(
         &self,
         pp: &NovaVDFPublicParams,
         num_steps: usize,
-        z0_primary: Vec<S1>,
-        z0_secondary: Vec<S2>,
-        zi_primary: &[S1],
-        zi_secondary: &[S2],
+        z0: Vec<S1>,
+        zi: &[S1],
     ) -> Result<bool, NovaError> {
+        let (z0_primary, zi_primary) = (z0, zi);
+        let z0_secondary = Self::z0_secondary();
+        let zi_secondary = z0_secondary.clone();
+
         let (zi_primary_verified, zi_secondary_verified) = match self {
             Self::Recursive(p) => p.verify(pp, num_steps, z0_primary, z0_secondary),
             Self::Compressed(p) => p.verify(pp, num_steps, z0_primary, z0_secondary),
         }?;
 
         Ok(zi_primary == zi_primary_verified && zi_secondary == zi_secondary_verified)
+    }
+
+    fn z0_secondary() -> Vec<S2> {
+        vec![<G2 as Group>::Scalar::zero()]
     }
 }
 
@@ -383,7 +391,6 @@ mod test {
     use crate::minroot::{PallasVDF, State};
     use crate::TEST_SEED;
 
-    use nova::traits::Group;
     use rand::SeedableRng;
     use rand_xorshift::XorShiftRng;
 
@@ -421,26 +428,12 @@ mod test {
             initial_state,
         );
 
-        let z0_secondary = vec![<G2 as Group>::Scalar::zero()];
-
-        let recursive_snark = NovaVDFProof::prove_recursively(
-            &pp,
-            &circuits,
-            num_iters_per_step,
-            z0_primary.clone(),
-            z0_secondary.clone(),
-        )
-        .unwrap();
+        let recursive_snark =
+            NovaVDFProof::prove_recursively(&pp, &circuits, num_iters_per_step, z0_primary.clone())
+                .unwrap();
 
         // verify the recursive SNARK
-        let res = recursive_snark.verify(
-            &pp,
-            num_steps,
-            z0_primary.clone(),
-            z0_secondary.clone(),
-            &zi_primary,
-            &z0_secondary,
-        );
+        let res = recursive_snark.verify(&pp, num_steps, z0_primary.clone(), &zi_primary);
 
         if !res.is_ok() {
             dbg!(&res);
@@ -450,14 +443,7 @@ mod test {
         // produce a compressed SNARK
         let compressed_snark = recursive_snark.compress(&pp).unwrap();
         // verify the compressed SNARK
-        let res = compressed_snark.verify(
-            &pp,
-            num_steps,
-            z0_primary,
-            z0_secondary.clone(),
-            &zi_primary,
-            &z0_secondary,
-        );
+        let res = compressed_snark.verify(&pp, num_steps, z0_primary, &zi_primary);
         assert!(res.is_ok());
     }
 }
