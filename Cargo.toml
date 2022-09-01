@@ -2,17 +2,20 @@
 name = "vdf"
 version = "0.1.0"
 authors = ["porcuquine <porcuquine@gmail.com>"]
-edition = "2018"
+license = "MIT OR Apache-2.0"
+edition = "2021"
 
 [dependencies]
-bellperson = "0.18.0"
+bellperson = { version = "0.22", default-features = false }
 crossbeam = "0.8"
-
-ff = "0.11.0"
+ff = "0.12.0"
+generic-array = "0.14.4"
 merlin = "2.0.0"
-nova = { package = "nova-snark", version = "0.4.0" }
+neptune = { version = "7.2.0", default-features = false }
+nova = { package = "nova-snark", version = "0.8.0", default-features = false }
 pairing = "0.21"
-pasta_curves = "0.2.1"
+pasta_curves = { version = "0.4.0", features = ["repr-c"] }
+pasta-msm = "0.1.1"
 rand = "0.8"
 subtle = "2.3"
 

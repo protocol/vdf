@@ -1,23 +1,22 @@
 use core::fmt::Debug;
-use pasta_curves::arithmetic::FieldExt;
+use ff::Field;
+
 use pasta_curves::{pallas, vesta};
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
-use std::mem::transmute;
-use std::slice;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ops::{Add, Sub, SubAssign};
 use std::sync::Arc;
+
+use nova::traits::Group;
 
 // Question: Should the naming of `PallasVDF` and `VestaVDF` be reversed?
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EvalMode {
     LTRSequential,
     LTRAddChainSequential,
     RTLSequential,
-    RTLParallel,
     RTLAddChainSequential,
-    RTLAddChainParallel,
 }
 
 impl EvalMode {
@@ -26,9 +25,7 @@ impl EvalMode {
             Self::LTRSequential,
             Self::LTRAddChainSequential,
             Self::RTLSequential,
-            Self::RTLParallel,
             Self::RTLAddChainSequential,
-            Self::RTLAddChainParallel,
         ]
     }
 }
@@ -39,35 +36,37 @@ unsafe impl Send for Sq {}
 unsafe impl Sync for Sq {}
 
 /// Modulus is that of `Fq`, which is the base field of `Vesta` and scalar field of `Pallas`.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct PallasVDF {
     eval_mode: EvalMode,
 }
 
-impl MinRootVDF<pallas::Scalar> for PallasVDF {
+impl MinRootVDF<pallas::Point> for PallasVDF {
     fn new_with_mode(eval_mode: EvalMode) -> Self {
         PallasVDF { eval_mode }
     }
 
     // To bench with this on 3970x:
     // RUSTFLAG="-C target-cpu=native -g" taskset -c 0,40 cargo bench
-    fn eval(
-        &mut self,
-        x: State<pallas::Scalar>,
-        t: u64,
-    ) -> (State<pallas::Scalar>, Option<Vec<State<pallas::Scalar>>>) {
+    fn eval(&mut self, x: State<pallas::Scalar>, t: u64) -> State<pallas::Scalar> {
         match self.eval_mode {
             EvalMode::LTRSequential
             | EvalMode::LTRAddChainSequential
             | EvalMode::RTLAddChainSequential
             | EvalMode::RTLSequential => self.simple_eval(x, t),
-            EvalMode::RTLAddChainParallel => self.eval_rtl_addition_chain(x, t),
-            EvalMode::RTLParallel => self.eval_rtl(x, t),
         }
     }
 
     fn element(n: u64) -> pallas::Scalar {
         pallas::Scalar::from(n)
+    }
+
+    fn exponent() -> [u64; 4] {
+        FQ_RESCUE_INVALPHA
+    }
+
+    fn inverse_exponent() -> u64 {
+        5
     }
 
     /// Pallas' inverse_exponent is 5, so we can hardcode this.
@@ -81,261 +80,11 @@ impl MinRootVDF<pallas::Scalar> for PallasVDF {
             EvalMode::RTLSequential => self.forward_step_rtl_sequential(x),
             EvalMode::RTLAddChainSequential => self.forward_step_sequential_rtl_addition_chain(x),
             EvalMode::LTRAddChainSequential => self.forward_step_ltr_addition_chain(x),
-            _ => unreachable!(),
         }
     }
 }
 
 impl PallasVDF {
-    /// Number of bits in exponent.
-    fn bit_count() -> usize {
-        254
-    }
-
-    // To bench with this on 3970x:
-    // RUSTFLAG="-C target-cpu=native -g" taskset -c 0,40 cargo bench
-    fn eval_rtl(
-        &mut self,
-        x: State<pallas::Scalar>,
-        t: u64,
-    ) -> (State<pallas::Scalar>, Option<Vec<State<pallas::Scalar>>>) {
-        let bit_count = Self::bit_count();
-        let squares1 = Arc::new(UnsafeCell::new(vec![[0u64; 4]; 254].into_boxed_slice()));
-        let sq = Sq(squares1);
-        let ready = Arc::new(AtomicUsize::new(1)); // Importantly, not zero.
-        let ready_clone = Arc::clone(&ready);
-
-        let result = crossbeam::scope(|s| {
-            s.spawn(|_| {
-                let squares = unsafe {
-                    transmute::<&mut [[u64; 4]], &mut [pallas::Scalar]>(slice::from_raw_parts_mut(
-                        (*sq.0.get()).as_mut_ptr(),
-                        bit_count,
-                    ))
-                };
-
-                macro_rules! store {
-                    ($index:ident, $val:ident) => {
-                        squares[$index] = $val;
-                        ready.store($index, Ordering::SeqCst)
-                    };
-                }
-
-                for _ in 0..t {
-                    while ready.load(Ordering::SeqCst) != 0 {}
-
-                    let mut next_square = squares[0];
-
-                    #[allow(clippy::needless_range_loop)]
-                    for i in 0..Self::bit_count() {
-                        if i > 0 {
-                            next_square = next_square.square();
-                        };
-
-                        store!(i, next_square);
-                    }
-                }
-            });
-            (0..t).fold(x, |acc, _| self.round_with_squares(acc, &sq, &ready_clone))
-        })
-        .unwrap();
-
-        (result, None)
-    }
-
-    // To bench with this on 3970x:
-    // RUSTFLAG="-C target-cpu=native -g" taskset -c 0,40 cargo bench
-    fn eval_rtl_addition_chain(
-        &mut self,
-        x: State<pallas::Scalar>,
-        t: u64,
-    ) -> (State<pallas::Scalar>, Option<Vec<State<pallas::Scalar>>>) {
-        let bit_count = Self::bit_count();
-        let squares1 = Arc::new(UnsafeCell::new(vec![[0u64; 4]; 254].into_boxed_slice()));
-        let sq = Sq(squares1);
-        let ready = Arc::new(AtomicUsize::new(1)); // Importantly, not zero.
-        let ready_clone = Arc::clone(&ready);
-
-        let result = crossbeam::scope(|s| {
-            s.spawn(|_| {
-                let squares = unsafe {
-                    transmute::<&mut [[u64; 4]], &mut [pallas::Scalar]>(slice::from_raw_parts_mut(
-                        (*sq.0.get()).as_mut_ptr(),
-                        bit_count,
-                    ))
-                };
-
-                macro_rules! store {
-                    ($index:ident, $val:ident) => {
-                        squares[$index] = $val;
-                        ready.store($index, Ordering::SeqCst)
-                    };
-                }
-
-                for _ in 0..t {
-                    while ready.load(Ordering::SeqCst) != 0 {}
-
-                    let mut next_square = squares[0];
-
-                    let first_section_bit_count = 128;
-
-                    #[allow(clippy::needless_range_loop)]
-                    for i in 0..first_section_bit_count {
-                        if i > 0 {
-                            next_square = next_square.square();
-                        };
-
-                        store!(i, next_square);
-                    }
-
-                    let mut k = first_section_bit_count;
-
-                    next_square = {
-                        let mut x = next_square;
-
-                        x = x.mul(&x.square());
-                        x.mul(&x.square().square().square().square())
-                    };
-
-                    for j in 1..=(8 * 15 + 1) {
-                        next_square = next_square.square();
-
-                        if j % 8 == 1 {
-                            store!(k, next_square);
-                            k += 1;
-                        }
-                    }
-                }
-            });
-            (0..t).fold(x, |acc, _| self.round_with_squares(acc, &sq, &ready_clone))
-        })
-        .unwrap();
-
-        (result, None)
-    }
-
-    /// one round in the slow/forward direction.
-    #[inline]
-    fn round_with_squares(
-        &mut self,
-        x: State<pallas::Scalar>,
-        squares: &Sq,
-        ready: &Arc<AtomicUsize>,
-    ) -> State<pallas::Scalar> {
-        State {
-            x: match self.eval_mode {
-                EvalMode::RTLParallel => self.forward_step_with_squares_naive_rtl(
-                    pallas::Scalar::add(&x.x, &x.y),
-                    squares,
-                    ready,
-                ),
-                EvalMode::RTLAddChainParallel => {
-                    self.forward_step_with_squares(pallas::Scalar::add(&x.x, &x.y), squares, ready)
-                }
-                _ => panic!("fell through in y_with_squares"),
-            },
-            // Increment the round.
-            y: pallas::Scalar::add(&x.x, &x.i),
-            i: pallas::Scalar::add(&x.i, &pallas::Scalar::one()),
-        }
-    }
-
-    #[inline]
-    fn forward_step_with_squares(
-        &mut self,
-        x: pallas::Scalar,
-        squares: &Sq,
-        ready: &Arc<AtomicUsize>,
-    ) -> pallas::Scalar {
-        let sq = squares.0.get();
-        unsafe { (**sq)[0] = transmute::<pallas::Scalar, [u64; 4]>(x) };
-
-        ready.store(0, Ordering::SeqCst);
-
-        let mut remaining = Self::exponent();
-        let mut acc = pallas::Scalar::one();
-
-        let bit_count = Self::bit_count();
-        let first_section_bit_count = 128;
-        let second_section_bit_count = bit_count - first_section_bit_count;
-        let n = first_section_bit_count + (second_section_bit_count / 8) + 1;
-
-        for next_index in 1..=n {
-            let current_index = next_index - 1;
-            let limb_index = current_index / 64;
-            let limb = remaining[limb_index];
-
-            let one = (limb & 1) == 1;
-            let in_second_section = next_index > first_section_bit_count;
-
-            if in_second_section || one {
-                while ready.load(Ordering::SeqCst)
-                    < if next_index > 1 {
-                        current_index
-                    } else {
-                        next_index
-                    }
-                {}
-
-                let squares =
-                    unsafe { transmute::<&[[u64; 4]], &[pallas::Scalar]>(&**(squares.0.get())) };
-                let elt = squares[current_index];
-                acc = acc.mul(&elt);
-            };
-
-            remaining[limb_index] = limb >> 1;
-        }
-        acc
-    }
-
-    #[inline]
-    fn forward_step_with_squares_naive_rtl(
-        &mut self,
-        x: pallas::Scalar,
-        squares: &Sq,
-        ready: &Arc<AtomicUsize>,
-    ) -> pallas::Scalar {
-        let sq = squares.0.get();
-        unsafe { (**sq)[0] = transmute::<pallas::Scalar, [u64; 4]>(x) };
-
-        ready.store(0, Ordering::SeqCst);
-
-        let mut remaining = Self::exponent();
-        let mut acc = pallas::Scalar::one();
-
-        let bit_count = Self::bit_count();
-        let first_section_bit_count = bit_count - 1;
-        let second_section_bit_count = bit_count - first_section_bit_count;
-        let n = first_section_bit_count + (second_section_bit_count / 8) + 1;
-
-        for next_index in 1..=n {
-            let current_index = next_index - 1;
-            let limb_index = current_index / 64;
-            let limb = remaining[limb_index];
-
-            let one = (limb & 1) == 1;
-            let in_second_section = next_index > first_section_bit_count;
-
-            if in_second_section || one {
-                while ready.load(Ordering::SeqCst)
-                    < if next_index > 1 {
-                        current_index
-                    } else {
-                        next_index
-                    }
-                {}
-
-                let squares =
-                    unsafe { transmute::<&[[u64; 4]], &[pallas::Scalar]>(&**(squares.0.get())) };
-                let elt = squares[current_index];
-                acc = acc.mul(&elt);
-            };
-
-            remaining[limb_index] = limb >> 1;
-        }
-        acc
-    }
-
     fn forward_step_ltr_addition_chain(&mut self, x: pallas::Scalar) -> pallas::Scalar {
         let sqr = |x: pallas::Scalar, i: u32| (0..i).fold(x, |x, _| x.square());
 
@@ -450,7 +199,7 @@ impl PallasVDF {
 /// Modulus is that of `Fp`, which is the base field of `Pallas and scalar field of Vesta.
 #[derive(Debug)]
 pub struct VestaVDF {}
-impl MinRootVDF<vesta::Scalar> for VestaVDF {
+impl MinRootVDF<vesta::Point> for VestaVDF {
     fn new_with_mode(_eval_mode: EvalMode) -> Self {
         VestaVDF {}
     }
@@ -458,6 +207,15 @@ impl MinRootVDF<vesta::Scalar> for VestaVDF {
     fn element(n: u64) -> vesta::Scalar {
         vesta::Scalar::from(n)
     }
+
+    fn exponent() -> [u64; 4] {
+        FP_RESCUE_INVALPHA
+    }
+
+    fn inverse_exponent() -> u64 {
+        5
+    }
+
     /// Vesta's inverse_exponent is 5, so we can hardcode this.
     fn inverse_step(x: vesta::Scalar) -> vesta::Scalar {
         x.mul(&x.square().square())
@@ -512,10 +270,23 @@ pub struct State<T> {
     pub y: T,
     pub i: T,
 }
+const FP_RESCUE_INVALPHA: [u64; 4] = [
+    0xe0f0f3f0cccccccd,
+    0x4e9ee0c9a10a60e2,
+    0x3333333333333333,
+    0x3333333333333333,
+];
 
-pub trait MinRootVDF<F>: Debug
+const FQ_RESCUE_INVALPHA: [u64; 4] = [
+    0xd69f2280cccccccd,
+    0x4e9ee0c9a143ba4a,
+    0x3333333333333333,
+    0x3333333333333333,
+];
+
+pub trait MinRootVDF<G>: Debug
 where
-    F: FieldExt,
+    G: Group,
 {
     fn new() -> Self
     where
@@ -530,49 +301,43 @@ where
         EvalMode::LTRSequential
     }
 
-    #[inline]
     /// Exponent used to take a root in the 'slow' direction.
-    fn exponent() -> [u64; 4] {
-        F::RESCUE_INVALPHA
-    }
+    fn exponent() -> [u64; 4];
 
-    #[inline]
     /// Exponent used in the 'fast' direction.
-    fn inverse_exponent() -> u64 {
-        F::RESCUE_ALPHA
-    }
+    fn inverse_exponent() -> u64;
 
     #[inline]
     /// The building block of a round in the slow, 'forward' direction.
-    fn forward_step_ltr_sequential(&mut self, x: F) -> F {
+    fn forward_step_ltr_sequential(&mut self, x: G::Scalar) -> G::Scalar {
         x.pow_vartime(Self::exponent())
     }
 
     #[inline]
     /// The building block of a round in the slow, 'forward' direction.
-    fn forward_step(&mut self, x: F) -> F {
+    fn forward_step(&mut self, x: G::Scalar) -> G::Scalar {
         self.forward_step_ltr_sequential(x)
     }
 
     #[inline]
     /// The building block of a round in the fast, 'inverse' direction.
-    fn inverse_step(x: F) -> F {
+    fn inverse_step(x: G::Scalar) -> G::Scalar {
         x.pow_vartime([Self::inverse_exponent(), 0, 0, 0])
     }
 
     /// one round in the slow/forward direction.
-    fn round(&mut self, s: State<F>) -> State<F> {
+    fn round(&mut self, s: State<G::Scalar>) -> State<G::Scalar> {
         State {
-            x: self.forward_step(F::add(s.x, s.y)),
-            y: F::add(s.x, s.i),
-            i: F::add(s.i, F::one()),
+            x: self.forward_step(G::Scalar::add(s.x, s.y)),
+            y: G::Scalar::add(s.x, s.i),
+            i: G::Scalar::add(s.i, G::Scalar::one()),
         }
     }
 
     /// One round in the fast/inverse direction.
-    fn inverse_round(s: State<F>) -> State<F> {
-        let i = F::sub(s.i, &F::one());
-        let x = F::sub(s.y, &i);
+    fn inverse_round(s: State<G::Scalar>) -> State<G::Scalar> {
+        let i = G::Scalar::sub(s.i, &G::Scalar::one());
+        let x = G::Scalar::sub(s.y, &i);
         let mut y = Self::inverse_step(s.x);
         y.sub_assign(&x);
         State { x, y, i }
@@ -580,106 +345,90 @@ where
 
     /// Evaluate input `x` with time/difficulty parameter, `t` in the
     /// slow/forward direction.
-    fn eval(&mut self, x: State<F>, t: u64) -> (State<F>, Option<Vec<State<F>>>) {
+    fn eval(&mut self, x: State<G::Scalar>, t: u64) -> State<G::Scalar> {
         self.simple_eval(x, t)
     }
 
-    fn simple_eval(&mut self, x: State<F>, t: u64) -> (State<F>, Option<Vec<State<F>>>) {
-        // TODO: Add ability to generate intermediates (and how many) or not.
-        // For now, default to None. To return all for dev/testing, uncomment the next line.
-
-        // let mut intermediates = Some(Vec::with_capacity(t as usize));
-
-        let mut intermediates: Option<Vec<_>> = None;
+    fn simple_eval(&mut self, x: State<G::Scalar>, t: u64) -> State<G::Scalar> {
         let mut acc = x;
         for _ in 0..t {
-            if let Some(ref mut intermediates) = intermediates {
-                intermediates.push(acc)
-            };
-
             acc = self.round(acc);
         }
 
-        (acc, intermediates)
+        acc
     }
 
     /// Invert evaluation of output `x` with time/difficulty parameter, `t` in
     /// the fast/inverse direction.
-    fn inverse_eval(x: State<F>, t: u64) -> State<F> {
+    fn inverse_eval(x: State<G::Scalar>, t: u64) -> State<G::Scalar> {
         (0..t).fold(x, |acc, _| Self::inverse_round(acc))
     }
 
     /// Quickly check that `result` is the result of having slowly evaluated
     /// `original` with time/difficulty parameter `t`.
-    fn check(result: State<F>, t: u64, original: State<F>) -> bool {
+    fn check(result: State<G::Scalar>, t: u64, original: State<G::Scalar>) -> bool {
         original == Self::inverse_eval(result, t)
     }
 
-    fn element(n: u64) -> F;
+    fn element(n: u64) -> G::Scalar;
 }
 
-#[derive(Debug)]
-pub struct VanillaVDFProof<V: MinRootVDF<F> + Debug, F: FieldExt> {
-    pub result: State<F>,
+#[derive(Debug, PartialEq)]
+pub struct Evaluation<V: MinRootVDF<G> + Debug, G: Group> {
+    pub result: State<G::Scalar>,
     pub t: u64,
-    pub intermediates: Option<Vec<State<F>>>,
     _v: PhantomData<V>,
 }
-impl<V: MinRootVDF<F>, F: FieldExt> Clone for VanillaVDFProof<V, F> {
+
+impl<V: MinRootVDF<G>, G: Group> Clone for Evaluation<V, G> {
     fn clone(&self) -> Self {
         Self {
             result: self.result,
             t: self.t,
-            intermediates: self.intermediates.clone(),
             _v: PhantomData::<V>::default(),
         }
     }
 }
 
-impl<V: MinRootVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
-    pub fn eval_and_prove(x: State<F>, t: u64) -> Self {
+impl<V: MinRootVDF<G>, G: Group> Evaluation<V, G> {
+    pub fn eval(x: State<G::Scalar>, t: u64) -> (Vec<G::Scalar>, Self) {
         let mut vdf = V::new();
-        let (result, intermediates) = vdf.eval(x, t);
+        let result = vdf.eval(x, t);
 
-        Self {
-            result,
-            t,
-            intermediates,
-            _v: PhantomData::<V>,
-        }
+        let z0 = vec![result.x, result.y, result.i];
+
+        (
+            z0,
+            Self {
+                result,
+                t,
+                _v: PhantomData::<V>,
+            },
+        )
     }
 
-    pub fn eval_and_prove_with_mode(eval_mode: EvalMode, x: State<F>, t: u64) -> Self {
+    pub fn eval_with_mode(eval_mode: EvalMode, x: State<G::Scalar>, t: u64) -> Self {
         let mut vdf = V::new_with_mode(eval_mode);
-        let (result, intermediates) = vdf.eval(x, t);
+        let result = vdf.eval(x, t);
         Self {
             result,
-            intermediates,
             t,
             _v: PhantomData::<V>,
         }
     }
 
-    pub fn result(&self) -> State<F> {
+    pub fn result(&self) -> State<G::Scalar> {
         self.result
     }
 
-    pub fn verify(&self, original: State<F>) -> bool {
+    pub fn verify(&self, original: State<G::Scalar>) -> bool {
         V::check(self.result, self.t, original)
     }
 
     pub fn append(&self, other: Self) -> Option<Self> {
         if other.verify(self.result) {
-            let intermediates = match (self.intermediates.clone(), other.intermediates) {
-                (Some(mut a), Some(b)) => {
-                    a.extend(b);
-                    Some(a)
-                }
-                _ => None,
-            };
             Some(Self {
                 result: other.result,
-                intermediates,
                 t: self.t + other.t,
                 _v: PhantomData::<V>,
             })
@@ -693,32 +442,33 @@ impl<V: MinRootVDF<F>, F: FieldExt> VanillaVDFProof<V, F> {
 mod tests {
     use super::*;
     use crate::TEST_SEED;
+
     use rand::SeedableRng;
     use rand_xorshift::XorShiftRng;
 
     #[test]
     fn test_exponents() {
-        test_exponents_aux::<PallasVDF, pallas::Scalar>();
-        test_exponents_aux::<VestaVDF, vesta::Scalar>();
+        test_exponents_aux::<PallasVDF, pallas::Point>();
+        test_exponents_aux::<VestaVDF, vesta::Point>();
     }
 
-    fn test_exponents_aux<V: MinRootVDF<F>, F: FieldExt>() {
+    fn test_exponents_aux<V: MinRootVDF<G>, G: Group>() {
         assert_eq!(V::inverse_exponent(), 5);
         assert_eq!(V::inverse_exponent(), 5);
     }
 
     #[test]
     fn test_steps() {
-        test_steps_aux::<PallasVDF, pallas::Scalar>();
-        test_steps_aux::<VestaVDF, vesta::Scalar>();
+        test_steps_aux::<PallasVDF, pallas::Point>();
+        test_steps_aux::<VestaVDF, vesta::Point>();
     }
 
-    fn test_steps_aux<V: MinRootVDF<F>, F: FieldExt>() {
+    fn test_steps_aux<V: MinRootVDF<G>, G: Group>() {
         let mut rng = XorShiftRng::from_seed(TEST_SEED);
         let mut vdf = V::new();
 
         for _ in 0..100 {
-            let x = F::random(&mut rng);
+            let x = G::Scalar::random(&mut rng);
             let y = vdf.forward_step(x);
             let z = V::inverse_step(y);
 
@@ -729,25 +479,29 @@ mod tests {
     #[test]
     fn test_eval() {
         println!("top");
-        test_eval_aux::<PallasVDF, pallas::Scalar>();
+        test_eval_aux::<PallasVDF, pallas::Point>();
     }
 
-    fn test_eval_aux<V: MinRootVDF<F>, F: FieldExt>() {
+    fn test_eval_aux<V: MinRootVDF<G>, G: Group>() {
         for mode in EvalMode::all().iter() {
-            test_eval_aux2::<V, F>(*mode)
+            test_eval_aux2::<V, G>(*mode)
         }
     }
 
-    fn test_eval_aux2<V: MinRootVDF<F>, F: FieldExt>(eval_mode: EvalMode) {
+    fn test_eval_aux2<V: MinRootVDF<G>, G: Group>(eval_mode: EvalMode) {
         let mut rng = XorShiftRng::from_seed(TEST_SEED);
         let mut vdf = V::new_with_mode(eval_mode);
 
         for _ in 0..10 {
             let t = 10;
-            let x = F::random(&mut rng);
-            let y = F::random(&mut rng);
-            let x = State { x, y, i: F::zero() };
-            let (result, _intermediates) = vdf.eval(x, t);
+            let x = G::Scalar::random(&mut rng);
+            let y = G::Scalar::random(&mut rng);
+            let x = State {
+                x,
+                y,
+                i: G::Scalar::zero(),
+            };
+            let result = vdf.eval(x, t);
             let again = V::inverse_eval(result, t);
 
             assert_eq!(x, again);
@@ -757,39 +511,30 @@ mod tests {
 
     #[test]
     fn test_vanilla_proof() {
-        test_vanilla_proof_aux::<PallasVDF, pallas::Scalar>();
-        test_vanilla_proof_aux::<VestaVDF, vesta::Scalar>();
+        test_vanilla_proof_aux::<PallasVDF, pallas::Point>();
+        test_vanilla_proof_aux::<VestaVDF, vesta::Point>();
     }
 
-    fn test_vanilla_proof_aux<V: MinRootVDF<F>, F: FieldExt>() {
+    fn test_vanilla_proof_aux<V: MinRootVDF<G>, G: Group>() {
         let mut rng = XorShiftRng::from_seed(TEST_SEED);
 
-        let x = F::random(&mut rng);
-        let y = F::zero();
-        let x = State { x, y, i: F::zero() };
+        let x = G::Scalar::random(&mut rng);
+        let y = G::Scalar::zero();
+        let x = State {
+            x,
+            y,
+            i: G::Scalar::zero(),
+        };
         let t = 4;
         let n = 3;
 
-        let first_proof = VanillaVDFProof::<V, F>::eval_and_prove(x, t);
+        let (_z0, first_proof) = Evaluation::<V, G>::eval(x, t);
 
         let final_proof = (1..n).fold(first_proof, |acc, _| {
-            let new_proof = VanillaVDFProof::<V, F>::eval_and_prove(acc.result, t);
-
-            if let Some(intermediates) = &acc.intermediates {
-                let last = intermediates.last().unwrap();
-                let inverse = V::inverse_round(acc.result);
-                assert_eq!(&inverse, last);
-            }
+            let (_, new_proof) = Evaluation::<V, G>::eval(acc.result, t);
 
             acc.append(new_proof).expect("failed to append proof")
         });
-
-        // Check that last intermediate is single-round inverse of final result.
-        if let Some(intermediates) = &final_proof.intermediates {
-            let last = intermediates.last().unwrap();
-            let inverse = V::inverse_round(final_proof.result);
-            assert_eq!(&inverse, last);
-        }
 
         assert_eq!(V::element(final_proof.t), final_proof.result.i);
         assert_eq!(n * t, final_proof.t);
